@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Secrets and local configuration
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Databases and local data (SQLite app database, WAL/SHM files, backups)
+# ---------------------------------------------------------------------------
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.db.bak.*
+data/
+backend/data/
+!data/.gitkeep
+!backend/data/.gitkeep
+
+# Uploaded / generated runtime files
+uploads/
+backend/uploads/
+storage/
+backend/storage/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+.python-version
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------------------------------------------------------------------------
+# Node / frontend build output
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Logs and temporary files
+# ---------------------------------------------------------------------------
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# ---------------------------------------------------------------------------
+# Tooling / agent workspace metadata
+# ---------------------------------------------------------------------------
+.freebuff/
+
+# ---------------------------------------------------------------------------
+# Editors and operating system files
+# ---------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+desktop.ini
