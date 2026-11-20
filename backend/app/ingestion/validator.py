@@ -31,7 +31,7 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
     "tool": ["id", "type", "name"],
     "x-mitre-tactic": ["id", "type", "name"],
     "attack-pattern": ["id", "type", "name"],
-    "relationship": ["id", "type", "name", "source_ref", "target_ref", "relationship_type"],
+    "relationship": ["id", "type", "source_ref", "target_ref", "relationship_type"],
 }
 
 

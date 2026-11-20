@@ -254,9 +254,16 @@ def cluster_kmeans(
 
 
 @router.get("/history")
-def history(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db), user=Depends(get_current_user)):
+def history(
+    limit: int = Query(100, ge=1, le=500),
+    include_synthetic: bool = Query(False, description="Include results derived from demonstration records"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    from app.core.provenance import hide_synthetic_analyses
+
     rows = (
-        db.query(AnalysisResult)
+        hide_synthetic_analyses(db.query(AnalysisResult), include_synthetic)
         .order_by(AnalysisResult.created_at.desc(), AnalysisResult.id.desc())
         .limit(limit)
         .all()

@@ -411,6 +411,43 @@ def test_mitre_api_endpoint_failure(client, admin_headers):
         assert "Network error" in response.json()["detail"]
 
 
+def test_mitre_run_persists_relationship_count_and_evidence_provenance():
+    from app.models.entities import Evidence
+
+    db = SessionLocal()
+    try:
+        bundle = _mitre_bundle()
+        adapter = MitreAttackAdapter(db=db, stix_url="https://example.com/attack.json")
+        adapter.fetch = lambda: [bundle]
+        result = adapter.run()
+
+        job = (
+            db.query(CollectionJob)
+            .filter(CollectionJob.id == result["job_id"])
+            .one()
+        )
+        assert result["relationships_created"] >= 1
+        assert job.relationships_created == result["relationships_created"]
+        assert job.status == "completed"
+
+        group_name = [
+            obj["name"] for obj in bundle["objects"] if obj["type"] == "intrusion-set"
+        ][0]
+        actor = db.query(Actor).filter(Actor.primary_handle == group_name).one()
+        evidence = (
+            db.query(Evidence)
+            .filter(Evidence.entity_type == "actor", Evidence.entity_id == actor.id)
+            .one()
+        )
+        assert evidence.import_job_id == job.id
+        assert evidence.source_modified_at is not None
+        assert evidence.source_url == "https://example.com/attack.json"
+        assert evidence.reference.startswith("https://attack.mitre.org/groups/")
+        assert evidence.external_record_id.startswith("intrusion-set--")
+    finally:
+        db.close()
+
+
 def test_mitre_api_requires_admin(client, analyst_headers):
     response = client.post("/api/ingestion/mitre-attack", json={}, headers=analyst_headers)
     assert response.status_code == 403

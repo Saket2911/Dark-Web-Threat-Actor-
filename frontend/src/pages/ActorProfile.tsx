@@ -128,6 +128,40 @@ export default function ActorProfile() {
         <Badge tone="slate">last observed {formatDate(profile.last_observed)}</Badge>
       </div>
 
+      {((profile.aliases?.length ?? 0) > 0 || profile.external_id) && (
+        <div className="space-y-1 rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-400">
+          {(profile.aliases?.length ?? 0) > 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-slate-500">Aliases from the source:</span>
+              {(profile.aliases ?? []).map((alias) => (
+                <Badge key={alias} tone="slate">
+                  {alias}
+                </Badge>
+              ))}
+            </div>
+          )}
+          {profile.external_id && (
+            <p>
+              <span className="text-slate-500">External ID: </span>
+              <span className="font-mono text-slate-300">{profile.external_id}</span>
+              {profile.source_url && (
+                <>
+                  {" · "}
+                  <a
+                    href={profile.source_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-cyan-400 hover:underline"
+                  >
+                    Original source
+                  </a>
+                </>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-wrap gap-1 border-b border-slate-800">
         {TABS.map((item) => (
           <button

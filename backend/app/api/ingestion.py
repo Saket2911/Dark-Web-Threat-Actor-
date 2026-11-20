@@ -27,6 +27,7 @@ from app.ingestion.feeds import (
     get_feed_status,
     ingest_feed,
 )
+from app.ingestion.jobs import create_job, fail_job as mark_job_failed, finish_job, serialize_job
 from app.ingestion.record_processor import (
     ProcessResult,
     RecordRejected,
@@ -78,19 +79,17 @@ def _read_upload(content: bytes, filename: str) -> None:
         )
 
 
-def _new_job(db: Session, name: str) -> CollectionJob:
-    job = CollectionJob(source_name=name[:255], status="running", started_at=utcnow())
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    return job
+def _new_job(db: Session, name: str, source_key: Optional[str] = None, source_url: Optional[str] = None) -> CollectionJob:
+    return create_job(db, name, source_key=source_key, source_url=source_url)
 
 
 def _finish_job(db: Session, job: CollectionJob, imported: int, rejected: int) -> None:
-    job.status = "completed" if rejected == 0 else "completed_with_errors"
-    job.records_imported = imported
-    job.finished_at = utcnow()
-    db.commit()
+    finish_job(
+        db,
+        job,
+        status="completed",
+        stats={"records_imported": imported, "records_fetched": imported, "records_rejected": rejected},
+    )
 
 
 @router.post("/record")
@@ -290,8 +289,8 @@ async def ingest_stix(
 
 
 @router.get("/feeds")
-def list_feeds(user=Depends(get_current_user)):
-    return get_feed_status()
+def list_feeds(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return get_feed_status(db)
 
 
 @router.post("/feeds/{source}")
@@ -308,34 +307,42 @@ def ingest_external_feed(
             detail=f"Unknown feed '{source}'. Available: {', '.join(sorted(FEED_REGISTRY))}",
         )
     request = body or FeedRequest()
-    job = _new_job(db, f"feed:{key}")
+    job = _new_job(db, f"feed:{key}", source_key=key, source_url=request.url)
     try:
-        result = ingest_feed(db, key, url=request.url, limit=request.limit)
+        result = ingest_feed(
+            db, key, url=request.url, limit=request.limit, job_id=job.id
+        )
         db.commit()
     except FeedAuthRequired as exc:
         db.rollback()
-        _fail_job(db, job)
+        mark_job_failed(db, job, str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except FeedUnavailableError as exc:
         db.rollback()
-        _fail_job(db, job)
+        mark_job_failed(db, job, str(exc))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         db.rollback()
-        _fail_job(db, job)
+        mark_job_failed(db, job, f"Feed ingestion failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Feed ingestion failed: {exc}") from exc
 
-    _finish_job(db, job, result.get("imported", 0), len(result.get("errors", [])))
+    finish_job(
+        db,
+        job,
+        status="completed",
+        stats={
+            "records_fetched": result.get("fetched", 0),
+            "records_validated": result.get("processed", 0),
+            "records_imported": result.get("imported", 0),
+            "records_skipped": result.get("duplicates", 0),
+            "records_rejected": result.get("rejected", 0),
+            "relationships_created": result.get("relationships_created", 0),
+        },
+        errors=result.get("errors", []),
+        details={"source_url": result.get("source_url")},
+    )
     audit(db, user.username, "ingest_feed", f"{key}: {result.get('imported', 0)} records")
-    return {**result, "job_id": job.id}
-
-
-def _fail_job(db: Session, job: CollectionJob) -> None:
-    record = db.query(CollectionJob).filter(CollectionJob.id == job.id).first()
-    if record:
-        record.status = "failed"
-        record.finished_at = utcnow()
-        db.commit()
+    return {**result, "job_id": job.id, "job": serialize_job(job)}
 
 
 @router.post("/mitre-attack")
@@ -348,27 +355,23 @@ def ingest_mitre_attack(
     from app.ingestion.mitre_attack import MitreAttackAdapter
 
     adapter = MitreAttackAdapter(db=db, stix_url=stix_url) if stix_url else MitreAttackAdapter(db=db)
-    job = _new_job(db, "mitre-attack-enterprise")
     try:
         result = adapter.run()
         db.commit()
     except Exception as exc:
         db.rollback()
-        _fail_job(db, job)
         raise HTTPException(status_code=500, detail=f"MITRE ATT&CK ingestion failed: {exc}") from exc
 
-    if result.get("errors") and result.get("records_imported", 0) == 0:
-        _fail_job(db, job)
+    if result.get("status") == "failed":
         raise HTTPException(
             status_code=502,
             detail=(
-                "MITRE ATT&CK ingestion produced no records. "
-                f"First error: {result['errors'][0]}"
+                "MITRE ATT&CK ingestion failed. "
+                f"First error: {(result.get('errors') or ['unknown'])[0]}"
             ),
         )
-    _finish_job(db, job, result.get("records_imported", 0), len(result.get("errors", [])))
     audit(db, user.username, "ingest_mitre", f"{result.get('records_imported', 0)} records")
-    return {**result, "job_id": job.id}
+    return result
 
 
 @router.get("/jobs")
@@ -379,17 +382,7 @@ def list_jobs(limit: int = 50, db: Session = Depends(get_db), user=Depends(get_c
         .limit(max(1, min(limit, 200)))
         .all()
     )
-    return [
-        {
-            "id": job.id,
-            "source": job.source_name,
-            "status": job.status,
-            "records": job.records_imported,
-            "started": job.started_at,
-            "finished": job.finished_at,
-        }
-        for job in rows
-    ]
+    return [serialize_job(job) for job in rows]
 
 
 @router.get("/jobs/{job_id}")
@@ -397,14 +390,7 @@ def get_job(job_id: int, db: Session = Depends(get_db), user=Depends(get_current
     job = db.query(CollectionJob).filter(CollectionJob.id == job_id).first()
     if not job:
         raise HTTPException(404, "Collection job not found")
-    return {
-        "id": job.id,
-        "source": job.source_name,
-        "status": job.status,
-        "records": job.records_imported,
-        "started": job.started_at,
-        "finished": job.finished_at,
-    }
+    return serialize_job(job)
 
 
 def _float(value, default: float) -> float:

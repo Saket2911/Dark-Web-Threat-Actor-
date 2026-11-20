@@ -317,14 +317,10 @@ class BaseIngestionAdapter(ABC):
         Returns:
             The CollectionJob database ID.
         """
-        # Clean up any existing collection jobs for this source to avoid
-        # stale records from previous test runs or failed imports
-        self.db.query(CollectionJob).filter(
-            CollectionJob.source_name == self.source_name
-        ).delete()
-
         job = CollectionJob(
             source_name=self.source_name,
+            source_key=getattr(self, "source_key", None),
+            source_url=getattr(self, "stix_url", None),
             status="running",
             records_imported=0,
             started_at=datetime.now(timezone.utc),

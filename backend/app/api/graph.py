@@ -22,6 +22,12 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, require_admin
+from app.core.provenance import (
+    hidden_actor_ids,
+    hidden_indicator_ids,
+    hidden_source_ids,
+    synthetic_visible,
+)
 from app.database.session import get_db
 from app.models.entities import (
     Actor,
@@ -29,6 +35,7 @@ from app.models.entities import (
     Campaign,
     Identifier,
     InfrastructureIndicator,
+    IntelligenceSource,
     Malware,
     Relationship,
     Tactic,
@@ -109,14 +116,12 @@ def _resolve_entity_node(db: Session, entity_type: str, entity_id: int) -> Optio
 
 
 def _relationship_endpoints(rel: Relationship):
-    source_id = rel.source_actor_id or (
-        rel.source_entity_id if rel.source_type == "actor" else None
-    )
-    target_id = rel.target_actor_id or (
-        rel.target_entity_id if rel.target_type == "actor" else None
-    )
-    source_type = rel.source_type or ("actor" if source_id else None)
-    target_type = rel.target_type or ("actor" if target_id else None)
+    """Resolve polymorphic endpoints, falling back to the legacy actor columns."""
+
+    source_type = rel.source_type or ("actor" if rel.source_actor_id else None)
+    target_type = rel.target_type or ("actor" if rel.target_actor_id else None)
+    source_id = rel.source_entity_id if rel.source_type else rel.source_actor_id
+    target_id = rel.target_entity_id if rel.target_type else rel.target_actor_id
     return source_type, source_id, target_type, target_id
 
 
@@ -149,6 +154,8 @@ def graph_data(
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     rel_types: Optional[str] = Query(None, description="Comma separated relationship types"),
     q: Optional[str] = Query(None, description="Search node labels"),
+    include_synthetic: bool = Query(False, description="Include labelled demonstration records (never in production)"),
+    limit: int = Query(1500, ge=50, le=20000, description="Maximum edges returned (real catalogs are large)"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -157,7 +164,15 @@ def graph_data(
     seen_nodes: Set[str] = set()
     seen_edges: Set[tuple] = set()
 
-    actors = db.query(Actor).order_by(Actor.id).all()
+    show_synthetic = synthetic_visible(include_synthetic)
+    hidden_actors = set() if show_synthetic else hidden_actor_ids(db)
+    hidden_sources = set() if show_synthetic else set(hidden_source_ids(db))
+    hidden_indicators = set() if show_synthetic else hidden_indicator_ids(db)
+
+    actors_query = db.query(Actor)
+    if hidden_actors:
+        actors_query = actors_query.filter(~Actor.id.in_(hidden_actors))
+    actors = actors_query.order_by(Actor.id).all()
     actors_by_id = {a.id: a for a in actors}
 
     if actor_id is not None:
@@ -181,6 +196,8 @@ def graph_data(
     if include_identifiers:
         for identifier in db.query(Identifier).order_by(Identifier.id).all():
             if identifier.actor_id not in allowed_actor_ids:
+                continue
+            if identifier.actor_id in hidden_actors:
                 continue
             node_id = _identifier_node_id(identifier.id_type, str(identifier.value))
             if node_id not in identifier_nodes:
@@ -233,6 +250,8 @@ def graph_data(
     for identifier in db.query(Identifier).all():
         if identifier.actor_id not in allowed_actor_ids:
             continue
+        if identifier.actor_id in hidden_actors:
+            continue
         node_id = _identifier_node_id(identifier.id_type, str(identifier.value))
         if node_id in identifier_nodes and len(owner_map.get(node_id, [])) > 1:
             identifier_nodes[node_id]["data"]["owners"] = owner_map[node_id]
@@ -255,8 +274,22 @@ def graph_data(
                 seen_nodes.add(node_id)
                 nodes.append(node)
 
+    truncated = False
     for rel in db.query(Relationship).order_by(Relationship.id).all():
+        if len(edges) >= limit:
+            truncated = True
+            break
         if wanted_types and (rel.rel_type or "").upper() not in wanted_types:
+            continue
+        if hidden_actors and (
+            (rel.source_type == "actor" and rel.source_entity_id in hidden_actors)
+            or (rel.target_type == "actor" and rel.target_entity_id in hidden_actors)
+        ):
+            continue
+        if hidden_indicators and (
+            (rel.source_type == "indicator" and rel.source_entity_id in hidden_indicators)
+            or (rel.target_type == "indicator" and rel.target_entity_id in hidden_indicators)
+        ):
             continue
         if (rel.score or 0.0) < min_score:
             continue
@@ -267,6 +300,13 @@ def graph_data(
             continue
         if t_type == "actor" and int(t_id) not in allowed_actor_ids:
             continue
+        if actor_id is not None and not (
+            (s_type == "actor" and int(s_id) == actor_id)
+            or (t_type == "actor" and int(t_id) == actor_id)
+        ):
+            # A focused view shows the selected actor's own neighbourhood, not
+            # unrelated catalogue edges that happen to share the graph.
+            continue
 
         source_node = f"actor_{s_id}" if s_type == "actor" else f"{s_type}_{s_id}"
         target_node = f"actor_{t_id}" if t_type == "actor" else f"{t_type}_{t_id}"
@@ -274,6 +314,8 @@ def graph_data(
         for entity_type, entity_id, node_id in ((s_type, s_id, source_node), (t_type, t_id, target_node)):
             if node_id in seen_nodes:
                 continue
+            if entity_type == "indicator" and int(entity_id) in hidden_indicators:
+                break
             resolved = _resolve_entity_node(db, entity_type, int(entity_id))
             if resolved is None:
                 break
@@ -319,6 +361,8 @@ def graph_data(
             "direct_edges": sum(1 for e in edges if e["data"].get("direct")),
             "inferred_edges": sum(1 for e in edges if e["data"].get("direct") is False),
             "focus_actor_id": actor_id,
+            "edge_limit": limit,
+            "truncated": truncated,
         },
     }
 

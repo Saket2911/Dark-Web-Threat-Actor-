@@ -37,6 +37,7 @@ class Actor(Base):
     created_at = Column(DateTime, default=utcnow)
     external_id = Column(String(255), index=True)  # MITRE STIX ID or external source ID
     source_url = Column(String(500))  # Original source URL
+    aliases = Column(JSON)  # Names/aliases exactly as published by the source
     origin = Column(String(50), default="manual", index=True)  # synthetic, external, manual
     handles = relationship("Handle", back_populates="actor", cascade="all, delete-orphan")
     identifiers = relationship("Identifier", back_populates="actor", cascade="all, delete-orphan")
@@ -97,6 +98,11 @@ class IntelligenceSource(Base):
     is_synthetic = Column(Boolean, default=False)
     origin = Column(String(50), default="manual")
     collected_at = Column(DateTime, default=utcnow)
+    last_success_at = Column(DateTime)
+    last_error = Column(Text)
+    last_error_at = Column(DateTime)
+    last_etag = Column(String(255))  # conditional-GET validator for incremental refresh
+    last_object_count = Column(Integer)
 
 
 class Campaign(Base):
@@ -183,6 +189,8 @@ class Evidence(Base):
     source_confidence = Column(String(50))
     reliability = Column(Float, default=0.5)
     raw_payload = Column(JSON)
+    import_job_id = Column(Integer, index=True)  # CollectionJob that first stored this record
+    source_modified_at = Column(DateTime)  # source-side last-modified, when published
     collected_at = Column(DateTime, default=utcnow)
     created_at = Column(DateTime, default=utcnow)  # kept for backward compatibility
     __table_args__ = (Index("ix_evidence_entity", "entity_type", "entity_id"),)
@@ -265,8 +273,19 @@ class CollectionJob(Base):
     __tablename__ = "collection_jobs"
     id = Column(Integer, primary_key=True)
     source_name = Column(String(255), index=True)
+    source_key = Column(String(100), index=True)  # feed registry key, e.g. mitre_attack
+    source_url = Column(String(500))
     status = Column(String(50), default="pending")
+    records_fetched = Column(Integer, default=0)
+    records_validated = Column(Integer, default=0)
     records_imported = Column(Integer, default=0)
+    records_updated = Column(Integer, default=0)
+    records_skipped = Column(Integer, default=0)
+    records_rejected = Column(Integer, default=0)
+    relationships_created = Column(Integer, default=0)
+    errors = Column(Text)
+    error_count = Column(Integer, default=0)
+    details = Column(JSON)
     started_at = Column(DateTime, default=utcnow)
     finished_at = Column(DateTime)
 

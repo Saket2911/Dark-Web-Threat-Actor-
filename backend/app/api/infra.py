@@ -7,6 +7,12 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
+from app.core.provenance import (
+    hidden_actor_ids,
+    hidden_indicator_ids,
+    hide_demo_indicators,
+    synthetic_visible,
+)
 from app.core.time import utcnow
 from app.database.session import get_db
 from app.models.entities import (
@@ -43,12 +49,13 @@ def list_infra(
     q: Optional[str] = None,
     type_filter: Optional[str] = Query(None, alias="type"),
     origin: Optional[str] = None,
+    include_synthetic: bool = Query(False, description="Include labelled demonstration records (never in production)"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    query = db.query(InfrastructureIndicator)
+    query = hide_demo_indicators(db.query(InfrastructureIndicator), include_synthetic)
     if q:
         term = f"%{q.strip()}%"
         query = query.filter(
@@ -71,8 +78,11 @@ def list_infra(
     )
     types = [
         {"type": row[0], "count": row[1]}
-        for row in db.query(
-            InfrastructureIndicator.indicator_type, func.count(InfrastructureIndicator.id)
+        for row in hide_demo_indicators(
+            db.query(
+                InfrastructureIndicator.indicator_type, func.count(InfrastructureIndicator.id)
+            ),
+            include_synthetic,
         )
         .group_by(InfrastructureIndicator.indicator_type)
         .all()
@@ -87,12 +97,20 @@ def list_infra(
 
 
 @router.get("/{indicator_id}")
-def get_indicator(indicator_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_indicator(
+    indicator_id: int,
+    include_synthetic: bool = Query(False, description="Include demonstration indicators (never in production)"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     indicator = db.query(InfrastructureIndicator).filter(InfrastructureIndicator.id == indicator_id).first()
     if not indicator:
         raise HTTPException(404, "Indicator not found")
+    if not synthetic_visible(include_synthetic) and indicator.id in hidden_indicator_ids(db):
+        raise HTTPException(404, "Indicator not found")
 
     associations, seen = [], set()
+    hidden_actors = set() if synthetic_visible(include_synthetic) else hidden_actor_ids(db)
 
     # 1. Actors whose identifier value matches the indicator value.
     for identifier in db.query(Identifier).filter(
@@ -100,7 +118,7 @@ def get_indicator(indicator_id: int, db: Session = Depends(get_db), user=Depends
         Identifier.id_type.in_(INFRA_TYPES),
     ).all():
         actor = db.query(Actor).filter(Actor.id == identifier.actor_id).first()
-        if actor and actor.id not in seen:
+        if actor and actor.id not in seen and actor.id not in hidden_actors:
             seen.add(actor.id)
             associations.append(
                 {
@@ -126,7 +144,7 @@ def get_indicator(indicator_id: int, db: Session = Depends(get_db), user=Depends
     for rel in relationships:
         if rel.source_type == "actor" and rel.target_entity_id == indicator.id:
             actor = db.query(Actor).filter(Actor.id == rel.source_entity_id).first()
-            if actor and actor.id not in seen:
+            if actor and actor.id not in seen and actor.id not in hidden_actors:
                 seen.add(actor.id)
                 associations.append(
                     {
@@ -188,8 +206,15 @@ def get_indicator(indicator_id: int, db: Session = Depends(get_db), user=Depends
 
 
 @router.get("/{indicator_id}/associations")
-def indicator_associations(indicator_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    detail = get_indicator(indicator_id, db=db, user=user)
+def indicator_associations(
+    indicator_id: int,
+    include_synthetic: bool = Query(False),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    detail = get_indicator(
+        indicator_id, include_synthetic=include_synthetic, db=db, user=user
+    )
     return {
         "indicator": detail["indicator"],
         "associated_actors": detail["associated_actors"],

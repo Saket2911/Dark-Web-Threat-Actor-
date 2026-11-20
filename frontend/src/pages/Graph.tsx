@@ -370,7 +370,17 @@ export default function Graph() {
           <Badge tone="green">{data.stats.edges} edges</Badge>
           <Badge tone="slate">{data.stats.direct_edges} direct</Badge>
           <Badge tone="violet">{data.stats.inferred_edges} inferred</Badge>
+          {data.stats.truncated && (
+            <Badge tone="amber">showing first {data.stats.edge_limit ?? 0} edges</Badge>
+          )}
         </div>
+      )}
+
+      {data?.stats.truncated && (
+        <p className="text-xs text-amber-400">
+          The database holds more evidence-backed relationships than can be drawn at once. Focus on an
+          actor or filter by relationship type to inspect the rest.
+        </p>
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">

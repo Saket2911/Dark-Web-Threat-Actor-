@@ -5,6 +5,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.deps import get_current_user, require_admin
+from app.core.provenance import hidden_actor_ids, hide_synthetic_actors, synthetic_visible
 from app.core.time import utcnow
 from app.database.session import get_db
 from app.models.entities import (
@@ -60,6 +61,7 @@ def _serialize_actor(actor: Actor, include_counts: bool = False) -> dict:
         "origin": actor.origin,
         "external_id": actor.external_id,
         "source_url": actor.source_url,
+        "aliases": actor.aliases or [],
     }
     if include_counts:
         payload["identifier_count"] = len(actor.identifiers)
@@ -133,6 +135,7 @@ def list_actors(
     category: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     origin: Optional[str] = Query(None, description="Filter by origin: synthetic, external, manual"),
+    include_synthetic: bool = Query(False, description="Include labelled demonstration records (never in production)"),
     sort: str = Query("handle", pattern="^(handle|id|last_observed|category)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -142,6 +145,9 @@ def list_actors(
     query = db.query(Actor).options(
         joinedload(Actor.identifiers), joinedload(Actor.handles), joinedload(Actor.timeline_events)
     )
+    if origin == "synthetic" and not synthetic_visible(include_synthetic):
+        raise HTTPException(400, "Synthetic records are hidden by default; pass include_synthetic=true in a non-production environment")
+    query = hide_synthetic_actors(query, include_synthetic)
     if q:
         term = f"%{q.strip()}%"
         query = query.filter(
@@ -212,14 +218,19 @@ def create_actor(body: ActorCreate, db: Session = Depends(get_db), user=Depends(
 
 
 @router.get("/{actor_id}")
-def get_actor(actor_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_actor(
+    actor_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     actor = (
         db.query(Actor)
         .options(joinedload(Actor.handles), joinedload(Actor.identifiers))
         .filter(Actor.id == actor_id)
         .first()
     )
-    if not actor:
+    if not actor or (not synthetic_visible(include_synthetic) and actor.id in hidden_actor_ids(db)):
         raise HTTPException(404, "Actor not found")
     return _serialize_actor(actor, include_counts=True)
 
@@ -262,7 +273,12 @@ def delete_actor(actor_id: int, db: Session = Depends(get_db), user=Depends(requ
 
 
 @router.get("/{actor_id}/profile")
-def actor_profile(actor_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def actor_profile(
+    actor_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     actor = (
         db.query(Actor)
         .options(
@@ -273,7 +289,7 @@ def actor_profile(actor_id: int, db: Session = Depends(get_db), user=Depends(get
         .filter(Actor.id == actor_id)
         .first()
     )
-    if not actor:
+    if not actor or (not synthetic_visible(include_synthetic) and actor.id in hidden_actor_ids(db)):
         raise HTTPException(404, "Actor not found")
 
     relationships = (
@@ -357,8 +373,15 @@ def actor_profile(actor_id: int, db: Session = Depends(get_db), user=Depends(get
 
 
 @router.get("/{actor_id}/identifiers")
-def list_identifiers(actor_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def list_identifiers(
+    actor_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     _get_actor_or_404(db, actor_id)
+    if not synthetic_visible(include_synthetic) and actor_id in hidden_actor_ids(db):
+        raise HTTPException(status_code=404, detail="Actor not found")
     rows = db.query(Identifier).filter(Identifier.actor_id == actor_id).order_by(Identifier.id).all()
     return [
         {
@@ -484,8 +507,15 @@ def add_handle(actor_id: int, body: HandleIn, db: Session = Depends(get_db), use
 
 
 @router.get("/{actor_id}/evidence")
-def list_evidence(actor_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def list_evidence(
+    actor_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     _get_actor_or_404(db, actor_id)
+    if not synthetic_visible(include_synthetic) and actor_id in hidden_actor_ids(db):
+        raise HTTPException(status_code=404, detail="Actor not found")
     rows = (
         db.query(Evidence, IntelligenceSource)
         .outerjoin(IntelligenceSource, Evidence.source_id == IntelligenceSource.id)

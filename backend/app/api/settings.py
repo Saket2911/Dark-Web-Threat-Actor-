@@ -42,6 +42,10 @@ def sources(db: Session = Depends(get_db), user=Depends(get_current_user)):
             "origin": source.origin,
             "url": source.url,
             "collected_at": source.collected_at,
+            "last_success_at": source.last_success_at,
+            "last_error": source.last_error,
+            "last_error_at": source.last_error_at,
+            "last_object_count": source.last_object_count,
         }
         for source in rows
     ]
@@ -111,13 +115,13 @@ def models(user=Depends(get_current_user)):
 
 
 @router.get("/feeds")
-def feeds(user=Depends(get_current_user)):
-    return get_feed_status()
+def feeds(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return get_feed_status(db)
 
 
 @router.get("/feeds/status")
-def feeds_status(user=Depends(get_current_user)):
-    return get_feed_status()
+def feeds_status(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return get_feed_status(db)
 
 
 @router.get("/system")

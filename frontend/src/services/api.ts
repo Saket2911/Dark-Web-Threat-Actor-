@@ -152,6 +152,7 @@ export interface Actor {
   origin: string;
   external_id?: string | null;
   source_url?: string | null;
+  aliases?: string[] | null;
   notes?: string | null;
   last_observed?: string | null;
   created_at?: string | null;
@@ -302,6 +303,8 @@ export interface GraphPayload {
     direct_edges: number;
     inferred_edges: number;
     focus_actor_id: number | null;
+    edge_limit?: number;
+    truncated?: boolean;
   };
 }
 

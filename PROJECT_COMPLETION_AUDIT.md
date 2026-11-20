@@ -1,110 +1,124 @@
 # Project Completion Audit — CN_project
 
-Audit performed against the existing codebase on 2026-11-19. This document records
-what existed, what was broken, the root causes, and what was changed. It is a
-verification record, not a plan.
+Audit record for the genuine-intelligence implementation on branch `version-2`,
+last updated 2026-11-19 after the provenance and job-accounting pass. Statements
+below were verified against the code, the canonical SQLite database
+(`backend/data/app.db`, Alembic head `d3e4f5a6b7c8`) and the running API.
 
-## 1. Original condition
+## 1. Scope of this pass
 
-The repository contained a FastAPI/SQLAlchemy backend, an Alembic history up to
-`69255c01a2e`, a React/TypeScript frontend, a seed script and a small test suite.
-Several modules were reported as complete (ingestion, relationship engine, ML,
-reports), but verification showed:
+The previous phase replaced synthetic-only demonstration storage with genuine public
+intelligence and added provenance/job tracking. This pass closed the remaining gaps:
 
-* two SQLite databases with different schema levels and no unambiguous canonical
-  path;
-* administrative endpoints reachable by any authenticated user;
-* an ingestion pipeline whose failures were partly swallowed;
-* a relationship engine that rolled back the whole build on a single failure;
-* a frontend that did not match several backend response shapes, contained
-  placeholder calculations and dead interactions;
-* a test suite that did not cover most endpoints.
+1. every genuine ingestion path stamps `evidence.import_job_id`, plus
+   `source_modified_at` where the provider publishes a modified timestamp;
+2. collection jobs persist `relationships_created`, and status reflects what was
+   actually written;
+3. APTnotes imports always create a tracked job, including direct connector calls;
+4. demonstration records are excluded consistently from dashboard aggregates,
+   analyses, investigations, infrastructure, graph, timeline and every export;
+5. documentation and the environment template describe the real behaviour.
 
-The reported acceptance figures (34/34 tests, 33 actors, 12 identifiers) were stale.
-
-## 2. Defects found and root causes
+## 2. Defects found and fixed in this pass
 
 | # | Defect | Root cause | Resolution |
 | --- | --- | --- | --- |
-| 1 | Two databases (`data/app.db`, `backend/data/app.db`) with different schemas | Relative SQLite path resolved against the process working directory | Paths resolve against `backend/`; canonical DB documented and migrated to head |
-| 2 | `MITRE ATT&CK` import crashed | `normalize()` called an undefined helper and referenced an undefined variable; tactic creation was unconditional | Import rewritten with STIX parsing, lookups and idempotent upserts |
-| 3 | Relationship build lost work on one bad pair | `db.rollback()` inside per-pair loops | Per-pair `SAVEPOINT`; failures counted, prior links retained |
-| 4 | Graph showed identifier ownership edges even when filtering by relationship type | Synthetic `HAS_IDENTIFIER` edges always emitted | Edge emission now honours `rel_types`; ownership nodes remain |
-| 5 | Frontend graph used `d.created` and rendered no edges | Backend field names differ (`created_at`, `evidence`, `relationship_id`) | Typed API client and rewritten explorer use the real payload |
-| 6 | Timeline chart had no data keys | Placeholder chart configuration | Chart reads `/dashboard/charts/activity` and `/timeline/summary` |
-| 7 | Investigation review wrote `relationship_id=0` and a fixed decision | Placeholder implementation | Review modal posts a real relationship id and decision, persisted with reviewer and notes |
-| 8 | Any authenticated user could register accounts and delete actors | Missing role checks | Registration and user administration are admin-only; actor and relationship deletion requires admin |
-| 9 | CORS allowed every origin | `CORS_ORIGINS=*` | Restricted to development origins; foreign preflights rejected |
-| 10 | Weak default secret silently accepted | Placeholder value | Startup warning retained; local `.env` now holds a random secret |
-| 11 | Deprecated `datetime.utcnow()` throughout | Legacy code | `app.core.time.utcnow()` used in application code |
-| 12 | Duplicate synthetic demo rows from an earlier seed run | Non-idempotent historical seed | Seeding is idempotent; duplicates are reported by `scripts/dedupe_synthetic.py` (not deleted without approval) |
-| 13 | Tests mutated production data | Tests used the application database | Per-session temporary database in `tests/conftest.py` |
+| 1 | Evidence never carried a collection-job id | `create_evidence()` had no parameter; connectors were not passed the job | Added `import_job_id`/`source_modified_at`; MITRE and all feed connectors pass them |
+| 2 | Successful MITRE relationship imports were reported `completed_empty` | Job status only looked at entity inserts | Persisted `relationships_created` (migration `d3e4f5a6b7c8`); status counts entities, updates and relationships |
+| 3 | APTnotes could run without job tracking | Only API/CLI callers created jobs | `ingest_feed()` creates and finishes its own job when none is supplied, and returns `job_id` |
+| 4 | NULL-typed genuine evidence disappeared from exports | SQL `NOT (... AND ...)` evaluates to NULL, excluding rows | NULL-safe provenance predicates; unlinked APTnotes reports (463) are visible again |
+| 5 | Legacy relationships with NULL polymorphic fields leaked demo edges | Early rows store actor ids only in `source_actor_id`/`target_actor_id` | Endpoint filter checks both columns; dashboard returned to 19,481 genuine edges (was 19,721) |
+| 6 | Dashboard counted demo investigations/analyses/sources/timeline | Counts queried whole tables | Provenance helpers applied to every aggregate and chart |
+| 7 | Synthetic analyses/investigations were reachable by direct id | List filtering only | Detail routes return 404 unless `include_synthetic=true` |
+| 8 | Demo indicators were reachable by direct id | No visibility check in detail | Detail/associations guarded; list and type counts share one filter |
+| 9 | Demo seed could run in production | Only `--demo` consent was checked | `seed.py` now refuses when `ENVIRONMENT=production` |
+| 10 | `.env.example` contained a stray `[TEMPLATE]` marker and described the key as ThreatFox-only | Historical template debt | Rewritten: no marker, both abuse.ch feeds documented, demo flag and production rule documented |
 
-## 3. Feature status
+## 3. Current verified state
 
-Legend: **CV** complete and verified · **IV** implemented but not fully verified ·
-**PI** partially implemented · **NI** not implemented · **BE** blocked by external
-dependency.
+### Database
+
+* Path: `backend/data/app.db`; Alembic head `d3e4f5a6b7c8`; 22 tables.
+* Actors: 187 external, 58 legacy manual demo, 33 synthetic.
+* Genuine relationships: 19,481 — USES 18,975, ASSOCIATED_WITH 480, ATTRIBUTED_TO 26.
+* Demonstration relationships: 240 SHARED_IDENTIFIER (legacy, NULL polymorphic type) and
+  3 POTENTIALLY_SAME_PERSONA.
+* Evidence: 2,507 genuine (MITRE 1,820; APTnotes 687, of which 463 are unlinked
+  reports), 54 demonstration.
+* Indicators: 24, all demonstration; timeline events: 60, all demonstration.
+* Analyses: 8, all demonstration. Investigations: 1 demonstration case with 1 pending
+  analyst review — preserved, hidden from default views.
+* Collection jobs: 1–5 historical MITRE/URLhaus runs, 6–7 APTnotes runs from this
+  pass. Historical rows were not rewritten.
+
+### Provenance
+
+* New genuine evidence receives the source, external record id, original
+  reference/URL, publication time, raw payload, `import_job_id` and (where published)
+  `source_modified_at`.
+* MITRE `modified` is stored as `source_modified_at`; APTnotes publishes no modified
+  timestamp, so it remains NULL rather than being invented.
+* Pre-existing rows were backfilled on 2026-11-20 from stored payloads only: 1,820 MITRE
+  rows linked to job 1 with `source_modified_at` from STIX `modified`, 687 APTnotes rows
+  linked to job 8 (`historical_backfill`). See `TEST_REPORT.md`.
+
+### Job accounting
+
+* `relationships_created` is a persisted column, exposed by the API and Settings UI.
+* Statuses: `completed`, `completed_no_changes`, `completed_empty`,
+  `completed_with_errors`, `not_modified`, `failed`.
+* An idempotent APTnotes re-import (689 fetched, 0 written, 689 duplicates) is
+  `completed_no_changes`, not an empty or failed run.
+* A failed fetch/auth check marks the job `failed` and imports nothing.
+
+### Demonstration isolation
+
+Default (production) views hide synthetic actors, legacy demo actors, synthetic or demo
+evidence, demo indicators, edges touching them, analyses involving them, demonstration
+cases and their timeline events. `include_synthetic=true` restores them outside
+production. Genuine records with incomplete fields are never hidden.
+
+## 4. Feature status
+
+Legend: **CV** complete and verified · **IV** implemented, not fully verified ·
+**BE** blocked by external dependency · **NI** not implemented.
 
 | Area | Status | Evidence |
 | --- | --- | --- |
-| JWT login, token validation, expiry, logout | CV | pytest auth tests; live login/401 checks |
-| PBKDF2 hashing, no password exposure | CV | auth tests; response inspection |
-| Admin/analyst RBAC | CV | 403 for analyst train/delete; admin-only registration |
-| Actor CRUD, search, filters, pagination, profile | CV | tests + live API + UI |
-| Handles, identifiers, evidence, timeline CRUD | CV | tests + UI profile tabs |
-| Identifier normalisation/validation | CV | strict email/domain/IP/wallet/PGP handling; 422 checks |
-| CSV/JSON/STIX ingestion, dedup, job summaries | CV | ingestion tests |
-| MITRE ATT&CK import | IV | code path repaired and status reported; full bundle import not executed in this session |
-| APTnotes/URLhaus adapters | IV | documented endpoints, retries, provenance; live availability depends on upstream |
-| ThreatFox | BE | requires abuse.ch Auth-Key; API reports `blocked_missing_credentials` |
-| Direct relationships from shared identifiers | CV | 240 persisted links; rebuild idempotent |
-| Inferred relationships from analysis | CV | 3 persisted hypotheses above threshold |
-| Relationship validation/deduplication/self-link prevention | CV | validator + tests |
-| Graph data, filters, focus neighbourhood, details | CV | tests + Cytoscape render with 138 edges |
-| Graph build/infer/statistics/components/clusters | CV | live endpoints |
-| Stylometric analysis | CV | tests; measured 0.5837 on short samples, 1.0 for identical text |
-| Behavioural analysis | CV | tests; measured cosine 1.0 with insufficient-event flag |
-| Weighted attribution with contributions/coverage | CV | measured 0.7422, coverage 0.70, Moderate |
-| K-Means / DBSCAN with summaries and guards | CV | measured k=3 silhouette 0.5013; DBSCAN 2 clusters, 0 noise |
-| Persisted style-inference model (train/infer/batch) | CV | tests; UI in Settings and Analysis |
-| Dashboard aggregates and charts | CV | live values rendered |
-| Infrastructure list/detail/associations | CV | 24 indicators; detail API |
-| Timeline filters, summary, creation | CV | 60 events; chart populated |
-| Investigations, entities, decisions, history | CV | case with 2 entities, 30 relationships, persisted review |
-| CSV/JSON/PDF exports | CV | row counts match database; PDFs return `application/pdf` |
-| Settings/status/weights/thresholds/feeds | CV | live pages |
-| Frontend pages, navigation, states | CV | production build; live render checks |
-| Browser end-to-end automation | NI | no suite configured; manual smoke checks only |
-| Frontend unit/component tests | NI | not configured in the project |
-
-## 4. Database changes
-
-* Added `analyst_reviews.investigation_id` (migration `a1b2c3d4e5f6`, already present
-  in history before this session).
-* Added metadata-driven query indexes (migration `b7c1d2e3f4a5`, applied to
-  `backend/data/app.db`).
-* No rows were deleted or reset. Backups taken before migration remain in
-  `backend/data/app.db.bak.*`.
-* Two synthetic text samples were added by the idempotent seed for the shared-PGP
-  scenario so the seeded investigation has evidence.
+| Auth, RBAC, hashing | CV | pytest; live 401/403 checks |
+| Actor CRUD, profile, identifiers, handles, evidence, timeline | CV | pytest + live API |
+| CSV/JSON/STIX/single-record ingestion | CV | pytest |
+| MITRE ATT&CK ingestion | CV | 26,699 objects, 1,820 entities, 19,481 relationships; ETag `not_modified` |
+| APTnotes ingestion and job tracking | CV | 687 stored; live re-imports = `completed_no_changes` with jobs 6 and 7 |
+| URLhaus | BE | `blocked_missing_credentials`; free Auth-Key required |
+| ThreatFox | BE | `blocked_missing_credentials`; free Auth-Key required |
+| Provenance stamping on new imports | CV | pytest asserts job id, modified time, reference, external id |
+| Provenance for pre-existing rows | CV | backfill executed; 0 genuine rows without a job id |
+| Relationship engine and graph | CV | 19,481 edges; focus/search/truncation checks |
+| Analysis (stylometry, behaviour, scoring, clustering, inference) | CV | pytest and earlier live runs |
+| Investigations and analyst decisions | CV | demonstration case preserved; review counts intact behind opt-in |
+| Exports (CSV/JSON/PDF) | CV | counts match default views: actors 187, relationships 19,481, evidence 2,507, investigations 0 |
+| Frontend build and pages | CV | `npm run build` passes; Settings shows relationship counts |
+| Browser automation / frontend unit tests | NI | manual smoke checks only |
+| Demonstration cleanup | PI | inventory exists; rows remain but are hidden from every default view |
 
 ## 5. Data quality notes
 
-* 91 actors exist: 33 synthetic, 58 manual. The manual actors include artifacts from
-  earlier manual testing (`alpha1` copies, `testactor`) and an existing `tester`
-  account.
-* The seed duplicates created by the earlier run are still present (22 duplicate
-  actors with dependent records). Merging them is an analyst decision; the dedupe
-  script reports them and will not delete actors that own data.
-* A stale database at the project root (`data/app.db`) is unused and was left intact.
+* The 58 legacy manual demo actors and 33 synthetic actors remain in the database but
+  are hidden from every default view and export. Two actors are referenced by the
+  demonstration investigation and its pending review, so cleanup must not delete them.
+* The historical MITRE job 2 created 19,481 relationships before the counter existed;
+  its row is preserved unchanged. The count is recorded here, in `TEST_REPORT.md` and in
+  an append-only `audit_logs` note (`historical_job_note`) rather than by rewriting it.
+* The `USES` relationships are ATT&CK catalogue links (group/software → technique),
+  not claims of observed use against a victim.
 
 ## 6. Security review
 
 * Secrets live only in `.env` (untracked); no secret is returned by the API.
-* JWT in the `Authorization` header, not cookies, so token-bearing requests are not
-  CSRF-forgeable by a browser; CORS restricts which origins can read responses.
-* Uploads are size-limited (`MAX_UPLOAD_BYTES`) and parsed with format checks.
+* JWT in the `Authorization` header, not cookies; CORS restricts readable origins.
+* Uploads are size-limited and parsed with format checks.
 * CSV exports neutralise spreadsheet formula injection.
 * SQL access uses SQLAlchemy parameter binding.
-* Audit log records authentication, mutations, imports and reviews.
+* Audit log records authentication, mutations, imports, reviews and backfills.
+* Admin-only: feed imports, MITRE import, model training, destructive deletes.

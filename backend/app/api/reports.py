@@ -21,6 +21,14 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
+from app.core.provenance import (
+    hidden_actor_ids,
+    hidden_investigation_ids,
+    hidden_source_ids,
+    hide_synthetic_evidence,
+    hide_synthetic_relationships,
+    synthetic_visible,
+)
 from app.core.time import utcnow
 from app.database.session import get_db
 from app.models.entities import (
@@ -61,7 +69,11 @@ def _safe_cell(value: Any) -> Any:
     return value
 
 
-def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
+def _rows(db: Session, kind: str, include_synthetic: bool = False) -> List[Dict[str, Any]]:
+    show = synthetic_visible(include_synthetic)
+    hidden_actors = set() if show else hidden_actor_ids(db)
+    hidden_sources = set() if show else set(hidden_source_ids(db))
+
     if kind == "actors":
         return [
             {
@@ -71,6 +83,7 @@ def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
                 "last_observed": a.last_observed,
             }
             for a in db.query(Actor).order_by(Actor.id).all()
+            if a.id not in hidden_actors
         ]
     if kind == "identifiers":
         return [
@@ -80,6 +93,7 @@ def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
                 "external_id": i.external_id,
             }
             for i in db.query(Identifier).order_by(Identifier.id).all()
+            if i.actor_id not in hidden_actors
         ]
     if kind == "relationships":
         return [
@@ -98,7 +112,11 @@ def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
                 "confidence_level": r.confidence_level,
                 "evidence": r.evidence,
             }
-            for r in db.query(Relationship).order_by(Relationship.id).all()
+            for r in hide_synthetic_relationships(
+                db.query(Relationship), include_synthetic
+            )
+            .order_by(Relationship.id)
+            .all()
         ]
     if kind == "evidence":
         sources = {s.id: s.name for s in db.query(IntelligenceSource).all()}
@@ -109,7 +127,9 @@ def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
                 "source": sources.get(e.source_id), "reliability": e.reliability,
                 "reference": e.reference, "collected_at": e.collected_at,
             }
-            for e in db.query(Evidence).order_by(Evidence.id).all()
+            for e in hide_synthetic_evidence(db.query(Evidence), include_synthetic)
+            .order_by(Evidence.id)
+            .all()
         ]
     if kind == "timeline":
         return [
@@ -118,27 +138,35 @@ def _rows(db: Session, kind: str) -> List[Dict[str, Any]]:
                 "description": t.description, "event_date": t.event_date, "source": t.source,
             }
             for t in db.query(TimelineEvent).order_by(TimelineEvent.id).all()
+            if t.actor_id not in hidden_actors
         ]
     if kind == "investigations":
+        hidden_investigations = set() if show else hidden_investigation_ids(db)
         return [
             {
                 "id": i.id, "title": i.title, "status": i.status,
                 "created_at": i.created_at, "notes": i.notes,
             }
             for i in db.query(Investigation).order_by(Investigation.id).all()
+            if i.id not in hidden_investigations
         ]
     raise HTTPException(422, f"Unsupported export kind. Valid: {', '.join(EXPORT_KINDS)}")
 
 
 @router.get("/export/csv")
-def export_csv(kind: str = "actors", db: Session = Depends(get_db), user=Depends(get_current_user)):
+def export_csv(
+    kind: str = "actors",
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     if kind not in EXPORT_KINDS:
         raise HTTPException(422, f"Unsupported export kind. Valid: {', '.join(EXPORT_KINDS)}")
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     headers = CSV_HEADERS[kind]
     writer.writerow(headers)
-    for row in _rows(db, kind):
+    for row in _rows(db, kind, include_synthetic):
         writer.writerow([_safe_cell(row.get(header)) for header in headers])
     return Response(
         content=buffer.getvalue(),
@@ -148,14 +176,20 @@ def export_csv(kind: str = "actors", db: Session = Depends(get_db), user=Depends
 
 
 @router.get("/export/json")
-def export_json(kind: str = "actors", db: Session = Depends(get_db), user=Depends(get_current_user)):
+def export_json(
+    kind: str = "actors",
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     if kind not in EXPORT_KINDS:
         raise HTTPException(422, f"Unsupported export kind. Valid: {', '.join(EXPORT_KINDS)}")
     payload = {
         "kind": kind,
         "generated_at": utcnow().isoformat(),
         "record_count": 0,
-        "records": _rows(db, kind),
+        "synthetic_excluded": not synthetic_visible(include_synthetic),
+        "records": _rows(db, kind, include_synthetic),
         "provenance_note": (
             "Records with origin='synthetic' are demonstration data; origin='external' "
             "records come from public feeds; origin='manual' records were entered by analysts."
@@ -216,9 +250,16 @@ def _pdf_response(buffer: io.BytesIO, filename: str) -> Response:
 
 
 @router.get("/pdf/{actor_id}")
-def actor_pdf(actor_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def actor_pdf(
+    actor_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     actor = db.query(Actor).filter(Actor.id == actor_id).first()
     if not actor:
+        raise HTTPException(404, "Actor not found")
+    if not synthetic_visible(include_synthetic) and actor.id in hidden_actor_ids(db):
         raise HTTPException(404, "Actor not found")
 
     styles = _styles()
@@ -373,9 +414,16 @@ def actor_pdf(actor_id: int, db: Session = Depends(get_db), user=Depends(get_cur
 
 
 @router.get("/pdf/investigation/{investigation_id}")
-def investigation_pdf(investigation_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def investigation_pdf(
+    investigation_id: int,
+    include_synthetic: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     investigation = db.query(Investigation).filter(Investigation.id == investigation_id).first()
     if not investigation:
+        raise HTTPException(404, "Investigation not found")
+    if not synthetic_visible(include_synthetic) and investigation_id in hidden_investigation_ids(db):
         raise HTTPException(404, "Investigation not found")
 
     styles = _styles()

@@ -1,118 +1,120 @@
-"""MITRE ATT&CK STIX 2.1 ingestion adapter.
-
-Imports MITRE ATT&CK Enterprise STIX data into the CTI platform.
-
-Extends BaseIngestionAdapter to fetch, validate, normalize, and persist
-MITRE ATT&CK objects (intrusion-sets, campaigns, malware, tools, tactics,
-techniques, and relationships) into the relational database.
+"""MITRE ATT&CK Enterprise STIX 2.1 ingestion.
 
 Official source:
-https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/
-enterprise-attack/enterprise-attack.json
+https://github.com/mitre-attack/attack-stix-data
+
+The adapter downloads the published Enterprise bundle, imports the supported
+object types (groups/intrusion sets, campaigns, malware, tools, tactics,
+techniques and their relationships), preserves the original STIX identifiers,
+timestamps, aliases and external references, and records honest statistics.
+
+Notes on interpretation
+-----------------------
+* MITRE ATT&CK group entries are catalogued intrusion sets. They are imported
+  with ``origin='external'`` and are *not* treated as independently verified
+  real-world identities. Relationships MITRE documents are stored with
+  ``relationship_classification='documented'`` and
+  ``confidence_level='limited'`` because ATT&CK itself states that group
+  attribution is not definitive.
+* Revoked and deprecated objects are not imported as active intelligence; they
+  are counted and reported so the omission is visible.
+* Re-imports are idempotent: entities are matched on their STIX ID, evidence on
+  (source, STIX ID, entity) and relationships on their endpoints and type.
 """
 
+from __future__ import annotations
+
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from stix2 import parse
 
-from app.ingestion.base import (
-    BaseIngestionAdapter,
-    FetchError,
-    IngestionAdapterError,
-    ParseError,
-    ValidationError,
+from app.core.time import utcnow
+from app.ingestion.base import BaseIngestionAdapter, FetchError, ParseError
+from app.ingestion.jobs import (
+    create_job,
+    fail_job,
+    finish_job,
+    record_source_failure,
+    record_source_success,
 )
-from app.ingestion.deduplicator import Deduplicator
-from app.ingestion.normalizer import (
-    extract_technique_tactic_mapping,
-    normalize_stix_bundle,
-    normalize_stix_object,
-    STIX_TYPE_MAP,
-)
-from app.ingestion.validator import validate_stix_object
-from app.services.evidence_validator import create_evidence
-from app.services.relationship_validator import (
-    VALID_RELATIONSHIP_TYPES,
-    create_relationship,
-)
+from app.ingestion.normalizer import normalize_stix_object
+from app.ingestion.validator import SUPPORTED_STIX_TYPES, validate_stix_object
 from app.models.entities import (
     Actor,
     Campaign,
+    CollectionJob,
+    Evidence,
+    IntelligenceSource,
     Malware,
-    Tool,
+    Relationship,
     Tactic,
     Technique,
+    Tool,
 )
+from app.services.evidence_validator import create_evidence
+from app.services.relationship_validator import create_relationship
 
-# Mapping from STIX relationship_type to internal rel_type
-STIX_RELATIONSHIP_MAP: Dict[str, str] = {
-    "related-to": "RELATED_TO",
-    "attributed-to": "ATTRIBUTED_TO",
-    "targets": "USES",
-    "uses": "USES",
-    "mitigates": "ASSOCIATED_WITH",
-    "detects": "ASSOCIATED_WITH",
-    "variant-of": "ASSOCIATED_WITH",
-    "imitates": "ASSOCIATED_WITH",
-    "targets-infrastructure": "ASSOCIATED_WITH_INFRASTRUCTURE",
-    "hosts": "ASSOCIATED_WITH_INFRASTRUCTURE",
-}
+logger = logging.getLogger(__name__)
 
-# Default MITRE ATT&CK Enterprise STIX URL
 MITRE_ATTACK_ENTERPRISE_URL = (
     "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/"
     "enterprise-attack/enterprise-attack.json"
 )
 
-# Relationship classification for MITRE-curated data
-MITRE_CLASSIFICATION = "documented"
-MITRE_CONFIDENCE_LEVEL = "strong"
+STIX_RELATIONSHIP_MAP: Dict[str, str] = {
+    "related-to": "RELATED_TO",
+    "attributed-to": "ATTRIBUTED_TO",
+    "targets": "USES",
+    "uses": "USES",
+    "delivers": "DELIVERS",
+    "drops": "DELIVERS",
+    "mitigates": "ASSOCIATED_WITH",
+    "detects": "ASSOCIATED_WITH",
+    "variant-of": "ASSOCIATED_WITH",
+    "imitates": "ASSOCIATED_WITH",
+    "subtechnique-of": "ASSOCIATED_WITH",
+    "targets-infrastructure": "ASSOCIATED_WITH_INFRASTRUCTURE",
+    "hosts": "ASSOCIATED_WITH_INFRASTRUCTURE",
+}
+
+SUPPORTED_PREFIXES: Dict[str, str] = {
+    "intrusion-set--": "actor",
+    "campaign--": "campaign",
+    "malware--": "malware",
+    "tool--": "tool",
+    "x-mitre-tactic--": "tactic",
+    "attack-pattern--": "technique",
+}
+
+MAX_STORED_ERRORS = 50
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
-    """Parse ISO 8601 datetime string to Python datetime object.
-
-    Args:
-        value: ISO 8601 datetime string (e.g., "2020-01-01T00:00:00Z").
-
-    Returns:
-        A datetime object, or None if the value is None or empty.
-    """
     if not value or not isinstance(value, str):
         return None
     try:
-        # Handle Z suffix (UTC)
         if value.endswith("Z"):
             value = value[:-1] + "+00:00"
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
+        # SQLite stores naive datetimes; normalise to naive UTC for comparisons.
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
     except (ValueError, TypeError):
         return None
 
 
+def _first_reference_url(obj: Dict[str, Any]) -> Optional[str]:
+    for ref in obj.get("external_references") or []:
+        if isinstance(ref, dict) and ref.get("url"):
+            return str(ref["url"])
+    return None
+
+
 class MitreAttackAdapter(BaseIngestionAdapter):
-    """MITRE ATT&CK Enterprise STIX 2.1 ingestion adapter.
-
-    Fetches the Enterprise ATT&CK STIX bundle from the official MITRE
-    repository, validates, normalizes, and persists all objects into the
-    CTI platform.
-
-    The adapter processes entities before relationships so that relationship
-    targets can be resolved. Revoked and deprecated objects are imported
-    with their status preserved in raw_payload.
-
-    Attributes:
-        source_name: "mitre-attack-enterprise"
-        source_type: "stix_bundle"
-        reliability: 0.9 (MITRE is authoritative)
-        is_synthetic: False
-        origin: "external"
-        stix_url: The URL to fetch the STIX bundle from.
-        batch_size: Number of objects to process per batch commit.
-        bundle_version: The MITRE ATT&CK version detected from the bundle.
-    """
+    """Fetch, normalise and persist the official Enterprise ATT&CK bundle."""
 
     source_name = "mitre-attack-enterprise"
     source_type = "stix_bundle"
@@ -126,445 +128,532 @@ class MitreAttackAdapter(BaseIngestionAdapter):
         stix_url: str = MITRE_ATTACK_ENTERPRISE_URL,
         batch_size: int = 100,
         source_name: Optional[str] = None,
+        force: bool = False,
     ):
-        """Initialize the MITRE ATT&CK adapter.
-
-        Args:
-            db: SQLAlchemy database session.
-            stix_url: URL to the Enterprise ATT&CK STIX JSON.
-            batch_size: Number of objects per batch commit.
-            source_name: Optional override for source name.
-        """
         super().__init__(db=db, source_name=source_name)
         self.stix_url = stix_url
         self.batch_size = batch_size
+        self.force = force
         self.bundle_version: Optional[str] = None
-        self._entity_id_map: Dict[str, int] = {}  # stix_id -> db_id
-        self.deduplicator = Deduplicator(db)
+        self._entity_id_map: Dict[str, Tuple[str, int]] = {}
+        self._source: Optional[IntelligenceSource] = None
+        self._etag: Optional[str] = None
+        self._not_modified = False
+        self._updated = 0
+        self._evidence_added = 0
+        self._relationships_created = 0
+        self._relationships_skipped = 0
+        self._revoked_skipped = 0
+        self._unsupported = 0
+        self._rejected = 0
+        self._error_count = 0
 
+    # ------------------------------------------------------------------
+    # Pipeline
+    # ------------------------------------------------------------------
     def fetch(self) -> List[Dict[str, Any]]:
-        """Download the MITRE ATT&CK Enterprise STIX bundle.
-
-        Returns:
-            A list containing a single element: the parsed bundle dict.
-
-        Raises:
-            FetchError: If the download fails.
-        """
-        self.logger.info("Fetching MITRE ATT&CK bundle from %s", self.stix_url)
+        headers = {"User-Agent": "CN-Project-CTI/1.0 (MITRE ATT&CK importer)"}
+        if self._etag:
+            headers["If-None-Match"] = self._etag
         try:
-            response = requests.get(self.stix_url, timeout=60)
+            response = requests.get(self.stix_url, timeout=120, headers=headers)
+        except requests.exceptions.RequestException as exc:
+            raise FetchError(f"Failed to fetch MITRE ATT&CK bundle: {exc}") from exc
+
+        if response.status_code == 304:
+            self._not_modified = True
+            return []
+        if response.status_code == 404:
+            raise FetchError(f"MITRE ATT&CK bundle not found at {self.stix_url}")
+        try:
             response.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            raise FetchError(
-                f"Failed to fetch MITRE ATT&CK bundle: {exc}"
-            ) from exc
+            raise FetchError(f"MITRE ATT&CK download failed: {exc}") from exc
 
         try:
             bundle = response.json()
         except ValueError as exc:
-            raise ParseError(
-                f"Failed to parse MITRE ATT&CK bundle as JSON: {exc}"
-            ) from exc
+            raise ParseError(f"MITRE ATT&CK bundle is not valid JSON: {exc}") from exc
 
-        # Extract bundle metadata
-        self.bundle_version = bundle.get("spec_version", "")
-
-        # STIX bundles wrap objects in an "objects" list
-        objects = bundle.get("objects", []) or []
-        self.logger.info(
-            "Fetched MITRE ATT&CK bundle with %d objects", len(objects)
-        )
-
-        # Return as a list with one element (the bundle dict) to match
-        # the base adapter's fetch() contract
+        self._etag = response.headers.get("ETag") or self._etag
+        self.bundle_version = bundle.get("spec_version") or None
+        objects = bundle.get("objects") or []
+        if not objects:
+            raise ParseError("MITRE ATT&CK bundle contained no objects")
+        logger.info("Fetched MITRE ATT&CK bundle with %d objects", len(objects))
         return [bundle]
 
     def parse(self, raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Parse STIX bundle objects using stix2.
-
-        Args:
-            raw_data: List containing the bundle dict.
-
-        Returns:
-            List of parsed STIX objects as dicts.
-
-        Raises:
-            ParseError: If parsing fails.
-        """
         if not raw_data:
-            raise ParseError("No raw data to parse")
-
+            return []
         bundle = raw_data[0]
-        objects = bundle.get("objects", []) or []
+        if not isinstance(bundle, dict):
+            raise ParseError("MITRE ATT&CK payload is not a JSON object")
 
-        parsed_objects = []
+        objects = bundle.get("objects") or []
+        if not isinstance(objects, list):
+            raise ParseError("MITRE ATT&CK bundle 'objects' is not a list")
+
+        parsed: List[Dict[str, Any]] = []
         for obj in objects:
+            if not isinstance(obj, dict):
+                self._unsupported += 1
+                continue
+            stix_type = obj.get("type")
+            if stix_type not in SUPPORTED_STIX_TYPES:
+                self._unsupported += 1
+                continue
             try:
-                parsed = parse(obj, version="2.1")
-                if hasattr(parsed, "to_dict"):
-                    parsed_dict = parsed.to_dict()
-                else:
-                    parsed_dict = dict(obj)
-                parsed_objects.append(parsed_dict)
+                validate_stix_object(obj)
             except Exception as exc:
-                self.logger.warning(
-                    "Failed to parse STIX object %s: %s",
-                    obj.get("id", "unknown"),
-                    exc,
-                )
-                parsed_objects.append(obj)
-
-        self.logger.info("Parsed %d STIX objects", len(parsed_objects))
-        return parsed_objects
+                self._rejected += 1
+                self._append_error(f"{obj.get('id', 'unknown')}: {exc}")
+                continue
+            parsed.append(obj)
+        return parsed
 
     def validate(self, record: Dict[str, Any]) -> bool:
-        """Validate a normalized STIX object record.
-
-        The base adapter passes normalized dictionaries to this method, while
-        the raw bundle uses ``type``/``id``. Both shapes are accepted.
-
-        Args:
-            record: A normalized or raw STIX record dict.
-
-        Returns:
-            True if valid, False otherwise.
-        """
-        candidate = record
-        if "type" not in candidate and candidate.get("stix_type"):
-            candidate = {
-                "type": candidate.get("stix_type"),
-                "id": candidate.get("stix_id") or candidate.get("external_id"),
-                "name": candidate.get("name"),
-                "description": candidate.get("description"),
-                "external_references": candidate.get("external_references") or [],
-                "kill_chain_phases": candidate.get("kill_chain_phases") or [],
-                "relationship_type": (candidate.get("raw_payload") or {}).get("relationship_type"),
-                "source_ref": (candidate.get("raw_payload") or {}).get("source_ref"),
-                "target_ref": (candidate.get("raw_payload") or {}).get("target_ref"),
-            }
+        candidate = record if "type" in record else {
+            "type": record.get("stix_type"),
+            "id": record.get("stix_id") or record.get("external_id"),
+            "name": record.get("name"),
+        }
         try:
             validate_stix_object(candidate)
             return True
-        except ValidationError as exc:
-            self.logger.debug("Validation failed: %s", exc)
+        except Exception:
             return False
 
     def normalize(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize a validated STIX object record.
-
-        Args:
-            record: A validated record dict.
-
-        Returns:
-            A normalized record dict ready for persistence.
-        """
         return normalize_stix_object(record)
 
-    def _persist_record(self, normalized_record: Dict[str, Any]) -> None:
-        """Persist a normalized STIX object to the database.
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _persist_record(self, normalized_record: Dict[str, Any]) -> bool:
+        """Create/update one entity. Returns True when the row was created."""
 
-        Creates or updates the entity record and creates an Evidence record
-        linking it to the MITRE ATT&CK IntelligenceSource.
-
-        Args:
-            normalized_record: A normalized record from normalize().
-        """
-        model_type = normalized_record.get("model_type", "unknown")
-        external_id = normalized_record.get("external_id", "")
-
-        # Build defaults for entity creation/update
-        # Map model-specific name field: Actor uses primary_handle, others use name
-        # Map model-specific description field: Actor uses notes, others use description
-        name_field = "primary_handle" if model_type == "Actor" else "name"
-        desc_field = "notes" if model_type == "Actor" else "description"
-
-        # Extract source_url from external_references in raw_payload
-        raw_payload = normalized_record.get("raw_payload", {}) or {}
-        external_refs = raw_payload.get("external_references", []) or []
-        source_url = external_refs[0].get("url", "") if external_refs else ""
-
-        # Parse timestamp strings to datetime objects
-        created_str = normalized_record.get("created")
-        modified_str = normalized_record.get("modified")
-        created_dt = _parse_iso_datetime(created_str) if created_str else None
-        modified_dt = _parse_iso_datetime(modified_str) if modified_str else None
-
-        defaults = {
-            name_field: normalized_record.get("name", ""),
-            desc_field: normalized_record.get("description", ""),
-            "source_url": source_url,
-            "origin": self.origin,
-        }
-
-        # Add timestamp fields only for models that actually define them.
-        # (Tactic has no first_seen/last_seen columns.)
-        if model_type == "Actor":
-            defaults["last_observed"] = modified_dt
-            # Actor.internal_id is required - derive it from the STIX id
-            defaults["internal_id"] = external_id
-        elif model_type in ("Campaign", "Malware", "Tool", "Technique"):
-            defaults["first_seen"] = created_dt
-            defaults["last_seen"] = modified_dt
-
-        # Create or update the entity using the deduplicator
-        entity, created = self.deduplicator.find_or_create_entity(
-            model_class=self._get_model_class(model_type),
-            external_id=external_id,
-            defaults=defaults,
-        )
-
-        # Create Evidence record linking the source to this entity
-        raw_payload = normalized_record.get("raw_payload", {}) or {}
-        external_refs = raw_payload.get("external_references", []) or []
-        source_url = external_refs[0].get("url", "") if external_refs else ""
-
-        created_str = normalized_record.get("created")
-        created_dt = _parse_iso_datetime(created_str) if created_str else None
-
-        create_evidence(
-            db=self.db,
-            source_id=self.source_id,
-            entity_type=model_type.lower(),
-            entity_id=entity.id,
-            evidence_type="stix_import",
-            content=normalized_record.get("description", ""),
-            reference=source_url,
-            external_record_id=external_id,
-            source_url=self.stix_url,
-            source_published_at=created_dt,
-            source_description=normalized_record.get("description", ""),
-            source_confidence=None,
-            reliability=self.reliability,
-            raw_payload=raw_payload,
-            commit=False,
-        )
-
-        # Track the entity ID mapping for relationship resolution
-        self._entity_id_map[external_id] = entity.id
-
-    def _get_model_class(self, model_type: str) -> Any:
-        """Get the SQLAlchemy model class for a normalized model type.
-
-        Args:
-            model_type: The model type string (Actor, Campaign, etc.).
-
-        Returns:
-            The SQLAlchemy model class.
-
-        Raises:
-            ValueError: If the model type is not supported.
-        """
-        model_map = {
+        model_type = normalized_record.get("model_type")
+        external_id = normalized_record.get("external_id") or ""
+        model_class = {
             "Actor": Actor,
             "Campaign": Campaign,
             "Malware": Malware,
             "Tool": Tool,
             "Tactic": Tactic,
             "Technique": Technique,
+        }.get(model_type or "")
+        if model_class is None or not external_id:
+            self._rejected += 1
+            return False
+
+        raw = normalized_record.get("raw_payload") or {}
+        name = (normalized_record.get("name") or external_id).strip()
+        description = normalized_record.get("description") or ""
+        source_url = _first_reference_url(raw)
+        created_dt = _parse_iso_datetime(normalized_record.get("created"))
+        modified_dt = _parse_iso_datetime(normalized_record.get("modified"))
+
+        defaults: Dict[str, Any] = {
+            "source_url": source_url,
+            "origin": self.origin,
         }
-        model_class = model_map.get(model_type)
-        if model_class is None:
-            raise ValueError(f"Unsupported model type: {model_type}")
-        return model_class
-
-    def run(self) -> Dict[str, Any]:
-        """Execute the full MITRE ATT&CK ingestion pipeline.
-
-        Overrides BaseIngestionAdapter.run() to handle relationship
-        processing after all entities have been persisted.
-
-        Returns:
-            Import statistics dictionary.
-        """
-        self.logger.info("Starting MITRE ATT&CK ingestion from %s", self.stix_url)
-
-        # Step 0: Create/resolve IntelligenceSource and CollectionJob
-        self.source_id = self._create_or_get_source()
-        self.collection_job_id = self._create_collection_job()
-
-        # Step 1: Fetch
-        try:
-            raw_data = self.fetch()
-        except Exception as exc:
-            self.logger.exception("Failed to fetch from %s: %s", self.stix_url, exc)
-            self._errors.append(str(exc))
-            self._update_collection_job(
-                status="failed",
-                records_imported=0,
+        if model_type == "Actor":
+            defaults.update(
+                {
+                    "primary_handle": name,
+                    "notes": description,
+                    "internal_id": external_id,
+                    "aliases": normalized_record.get("aliases") or None,
+                    "last_observed": modified_dt,
+                }
             )
-            return {
-                "source_name": self.source_name,
-                "source_type": self.source_type,
-                "records_fetched": 0,
-                "records_parsed": 0,
-                "records_validated": 0,
-                "records_normalized": 0,
-                "records_imported": 0,
-                "errors": self._errors,
-                "relationships_created": 0,
-                "relationships_skipped": 0,
-                "bundle_version": self.bundle_version,
-            }
-        self.logger.info("Fetched %d raw records from %s", len(raw_data), self.source_name)
-
-        # Step 2: Parse
-        parsed = self.parse(raw_data)
-        self.logger.info("Parsed %d STIX objects", len(parsed))
-
-        # Step 3: Build bundle for normalization from valid objects
-        bundle_data = {"objects": parsed, "type": "bundle", "id": self.stix_url}
-
-        # Step 4: Normalize valid objects
-        normalized = normalize_stix_bundle(bundle_data)
-
-        # Step 5: Process entities first (actors, campaigns, malware, tools,
-        # tactics, techniques)
-        entity_types = [
-            "actors", "campaigns", "malware", "tools", "tactics", "techniques"
-        ]
-        for entity_type in entity_types:
-            entities = normalized.get(entity_type, [])
-            self.logger.info(
-                "Processing %d %s entities", len(entities), entity_type
-            )
-            for norm_obj in entities:
-                # Persist (already validated and normalized)
-                self._persist_record(norm_obj)
-                self._records_imported += 1
-
-        # Commit entities before processing relationships
-        self.db.commit()
-        self.logger.info("Committed %d entities", self._records_imported)
-
-        # Step 6: Process relationships
-        relationships = normalized.get("relationships", [])
-        self.logger.info("Processing %d relationships", len(relationships))
-
-        # Build the set of all known STIX IDs for relationship validation
-        all_stix_ids = set()
-        for entity_type in entity_types:
-            for obj in normalized.get(entity_type, []):
-                all_stix_ids.add(obj.get("stix_id", ""))
-        # Also include relationship IDs themselves
-        for rel in relationships:
-            all_stix_ids.add(rel.get("stix_id", ""))
-
-        relationships_created = 0
-        relationships_skipped = 0
-
-        for norm_rel in relationships:
-            source_ref = norm_rel.get("raw_payload", {}).get("source_ref", "")
-            target_ref = norm_rel.get("raw_payload", {}).get("target_ref", "")
-            rel_type_stix = norm_rel.get("raw_payload", {}).get("relationship_type", "")
-
-            # Validate source and target exist in our entity map
-            source_actor_id = self._entity_id_map.get(source_ref)
-            target_actor_id = self._entity_id_map.get(target_ref)
-
-            if source_actor_id is None:
-                self._errors.append(
-                    f"Relationship {norm_rel.get('stix_id', 'unknown')}: "
-                    f"source_actor_id '{source_ref}' not found in imported entities"
-                )
-                relationships_skipped += 1
-                continue
-            if target_actor_id is None:
-                self._errors.append(
-                    f"Relationship {norm_rel.get('stix_id', 'unknown')}: "
-                    f"target_actor_id '{target_ref}' not found in imported entities"
-                )
-                relationships_skipped += 1
-                continue
-
-            # Map STIX relationship type to internal rel_type
-            internal_rel_type = STIX_RELATIONSHIP_MAP.get(
-                rel_type_stix, "RELATED_TO"
+        elif model_type == "Tactic":
+            defaults.update({"name": name, "description": description})
+        else:
+            defaults.update(
+                {
+                    "name": name,
+                    "description": description,
+                    "first_seen": created_dt,
+                    "last_seen": modified_dt,
+                }
             )
 
-            # Build evidence text explaining the original STIX relationship
-            evidence_text = (
-                f"MITRE ATT&CK STIX relationship '{rel_type_stix}' "
-                f"({source_ref} -> {target_ref}), imported from {self.source_name}."
-            )
-
-            # Create or update relationship
-            rel, created = self.deduplicator.find_or_create_relationship(
-                source_type=self._get_source_type_from_id(source_ref),
-                source_entity_id=source_actor_id,
-                target_type=self._get_source_type_from_id(target_ref),
-                target_entity_id=target_actor_id,
-                rel_type=internal_rel_type,
-                defaults={
-                    "evidence": evidence_text,
-                    "score": 0.8,
-                    "relationship_classification": MITRE_CLASSIFICATION,
-                    "confidence_level": MITRE_CONFIDENCE_LEVEL,
-                    "direct": True,
-                },
-            )
-
-            if created:
-                relationships_created += 1
+        existing = (
+            self.db.query(model_class)
+            .filter(model_class.external_id == external_id)
+            .first()
+        )
+        created = existing is None
+        if existing is None:
+            entity = model_class(external_id=external_id, **defaults)
+            self.db.add(entity)
+            self.db.flush()
+        else:
+            entity = existing
+            # Refresh source-published fields; never invent values.
+            if model_type == "Actor":
+                if name and entity.primary_handle != name:
+                    entity.primary_handle = name
+                if normalized_record.get("aliases"):
+                    entity.aliases = normalized_record["aliases"]
+                if description:
+                    entity.notes = description
+                if modified_dt and (entity.last_observed is None or modified_dt > entity.last_observed):
+                    entity.last_observed = modified_dt
+            elif model_type == "Tactic":
+                if name and entity.name != name:
+                    entity.name = name
+                if description:
+                    entity.description = description
             else:
-                relationships_skipped += 1
+                if name and entity.name != name:
+                    entity.name = name
+                if description:
+                    entity.description = description
+                if modified_dt and (entity.last_seen is None or modified_dt > entity.last_seen):
+                    entity.last_seen = modified_dt
+            if source_url and not entity.source_url:
+                entity.source_url = source_url
+            if not entity.origin:
+                entity.origin = self.origin
+            self.db.flush()
+            self._updated += 1
 
-        # Commit relationships
+        self._entity_id_map[external_id] = (model_type.lower(), entity.id)
+
+        already = (
+            self.db.query(Evidence.id)
+            .filter(
+                Evidence.source_id == self._source.id,
+                Evidence.external_record_id == external_id,
+                Evidence.entity_type == model_type.lower(),
+                Evidence.entity_id == entity.id,
+            )
+            .first()
+        )
+        if not already:
+            try:
+                create_evidence(
+                    db=self.db,
+                    source_id=self._source.id,
+                    entity_type=model_type.lower(),
+                    entity_id=entity.id,
+                    evidence_type="stix_object",
+                    content=description or name,
+                    reference=source_url,
+                    external_record_id=external_id,
+                    source_url=self.stix_url,
+                    source_published_at=created_dt,
+                    source_modified_at=modified_dt,
+                    source_description=f"MITRE ATT&CK {normalized_record.get('stix_type')}: {name}",
+                    reliability=self.reliability,
+                    raw_payload=raw,
+                    import_job_id=self.collection_job_id,
+                    commit=False,
+                )
+                self._evidence_added += 1
+            except Exception as exc:
+                self._append_error(f"evidence for {external_id}: {exc}")
+        return created
+
+    def _persist_relationships_bulk(self, relationships: List[Dict[str, Any]]) -> None:
+        """Insert documented relationships in batches without per-row probes.
+
+        Endpoints are guaranteed to exist because they come from entities this
+        run persisted; validation here is structural (types, relationship
+        vocabulary, self-reference) and duplicates are removed against an
+        in-memory set of existing keys.
+        """
+
+        from app.services.relationship_validator import (
+            SUPPORTED_ENTITY_TYPES,
+            VALID_RELATIONSHIP_TYPES,
+        )
+
+        existing = {
+            (row[0], row[1], row[2], row[3], row[4])
+            for row in self.db.query(
+                Relationship.source_type,
+                Relationship.source_entity_id,
+                Relationship.target_type,
+                Relationship.target_entity_id,
+                Relationship.rel_type,
+            ).all()
+        }
+
+        pending = 0
+        for rel in relationships:
+            payload = rel.get("raw_payload") or {}
+            source_ref = payload.get("source_ref") or ""
+            target_ref = payload.get("target_ref") or ""
+            stix_rel_type = (payload.get("relationship_type") or "related-to").lower()
+            stix_rel_id = rel.get("external_id") or payload.get("id") or ""
+
+            source_info = self._entity_id_map.get(source_ref)
+            target_info = self._entity_id_map.get(target_ref)
+            if not source_info or not target_info:
+                self._relationships_skipped += 1
+                continue
+
+            source_type, source_id = source_info
+            target_type, target_id = target_info
+            internal_type = STIX_RELATIONSHIP_MAP.get(stix_rel_type, "RELATED_TO")
+
+            if (
+                source_type not in SUPPORTED_ENTITY_TYPES
+                or target_type not in SUPPORTED_ENTITY_TYPES
+                or internal_type not in VALID_RELATIONSHIP_TYPES
+                or (source_type == target_type and source_id == target_id)
+            ):
+                self._relationships_skipped += 1
+                continue
+
+            key = (source_type, source_id, target_type, target_id, internal_type)
+            if key in existing:
+                self._relationships_skipped += 1
+                continue
+            existing.add(key)
+
+            self.db.add(
+                Relationship(
+                    source_actor_id=source_id if source_type == "actor" else None,
+                    target_actor_id=target_id if target_type == "actor" else None,
+                    source_type=source_type,
+                    source_entity_id=source_id,
+                    target_type=target_type,
+                    target_entity_id=target_id,
+                    rel_type=internal_type,
+                    evidence=(
+                        f"MITRE ATT&CK documents STIX relationship '{stix_rel_type}' "
+                        f"between {source_ref} and {target_ref} (relationship {stix_rel_id}). "
+                        "ATT&CK group attribution is a catalogued assessment, not independently "
+                        "verified identity."
+                    ),
+                    score=0.8,
+                    relationship_classification="documented",
+                    confidence_level="limited",
+                    source_confidence=None,
+                    direct=True,
+                )
+            )
+            self._relationships_created += 1
+            pending += 1
+            if pending >= 1000:
+                self.db.commit()
+                pending = 0
         self.db.commit()
 
-        # Update collection job (entity count; relationship counts are reported
-        # separately so the same unit is never counted twice)
-        self._update_collection_job(
-            status="completed",
-            records_imported=self._records_imported,
-        )
+    def _persist_relationship(self, norm_rel: Dict[str, Any]) -> bool:
+        payload = norm_rel.get("raw_payload") or {}
+        source_ref = payload.get("source_ref") or ""
+        target_ref = payload.get("target_ref") or ""
+        stix_rel_type = (payload.get("relationship_type") or "related-to").lower()
+        stix_rel_id = norm_rel.get("external_id") or payload.get("id") or ""
 
-        self.logger.info(
-            "MITRE ATT&CK import complete: %d entities, %d relationships created, "
-            "%d skipped",
-            self._records_imported, relationships_created, relationships_skipped,
-        )
+        source_info = self._entity_id_map.get(source_ref)
+        target_info = self._entity_id_map.get(target_ref)
+        if not source_info or not target_info:
+            self._relationships_skipped += 1
+            return False
 
+        source_type, source_id = source_info
+        target_type, target_id = target_info
+        internal_type = STIX_RELATIONSHIP_MAP.get(stix_rel_type, "RELATED_TO")
+
+        existing = (
+            self.db.query(Relationship.id)
+            .filter(
+                Relationship.source_type == source_type,
+                Relationship.source_entity_id == source_id,
+                Relationship.target_type == target_type,
+                Relationship.target_entity_id == target_id,
+                Relationship.rel_type == internal_type,
+            )
+            .first()
+        )
+        if existing:
+            self._relationships_skipped += 1
+            return False
+
+        evidence_text = (
+            f"MITRE ATT&CK documents STIX relationship '{stix_rel_type}' "
+            f"between {source_ref} and {target_ref} (relationship {stix_rel_id}). "
+            "ATT&CK group attribution is a catalogued assessment, not independently "
+            "verified identity."
+        )
+        try:
+            create_relationship(
+                db=self.db,
+                source_type=source_type,
+                source_entity_id=source_id,
+                target_type=target_type,
+                target_entity_id=target_id,
+                rel_type=internal_type,
+                evidence=evidence_text,
+                score=0.8,
+                relationship_classification="documented",
+                confidence_level="limited",
+                source_confidence=None,
+                direct=True,
+                commit=False,
+            )
+            self._relationships_created += 1
+            return True
+        except Exception as exc:
+            self._relationships_skipped += 1
+            self._append_error(f"relationship {stix_rel_id}: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    def run(self) -> Dict[str, Any]:
+        self._records_imported = 0
+        self._updated = 0
+        self._evidence_added = 0
+        self._relationships_created = 0
+        self._relationships_skipped = 0
+        self._revoked_skipped = 0
+        self._unsupported = 0
+        self._rejected = 0
+        self._error_count = 0
+        self._errors: List[str] = []
+
+        source_id = self._create_or_get_source()
+        self._source = self.db.query(IntelligenceSource).filter(IntelligenceSource.id == source_id).one()
+        if self.stix_url and not self._source.url:
+            self._source.url = self.stix_url
+            self.db.commit()
+        self._etag = None if self.force else self._source.last_etag
+
+        job: CollectionJob = create_job(
+            self.db,
+            self.source_name,
+            source_key="mitre_attack",
+            source_url=self.stix_url,
+        )
+        self.collection_job_id = job.id
+
+        try:
+            raw = self.fetch()
+        except Exception as exc:
+            logger.exception("MITRE ATT&CK fetch failed: %s", exc)
+            self._append_error(str(exc))
+            record_source_failure(self.db, self._source, str(exc))
+            fail_job(self.db, job, str(exc))
+            return self._result(job, fetched=0, status="failed")
+
+        if self._not_modified or not raw:
+            record_source_success(self.db, self._source, 0, etag=self._etag)
+            finish_job(
+                self.db,
+                job,
+                status="not_modified",
+                stats={"records_fetched": 0},
+                details={"reason": "The official bundle is unchanged since the last import (HTTP 304)."},
+            )
+            return self._result(job, fetched=0, status="not_modified")
+
+        try:
+            objects = self.parse(raw)
+        except Exception as exc:
+            record_source_failure(self.db, self._source, str(exc))
+            fail_job(self.db, job, str(exc))
+            return self._result(job, fetched=0, status="failed")
+
+        fetched = len((raw[0] or {}).get("objects") or [])
+        entities: List[Dict[str, Any]] = []
+        relationships: List[Dict[str, Any]] = []
+        for obj in objects:
+            normalized = normalize_stix_object(obj)
+            if normalized.get("revoked") or normalized.get("deprecated"):
+                self._revoked_skipped += 1
+                continue
+            if normalized.get("model_type") == "Relationship":
+                relationships.append(normalized)
+            else:
+                entities.append(normalized)
+
+        for entity in entities:
+            savepoint = self.db.begin_nested()
+            try:
+                created = self._persist_record(entity)
+                savepoint.commit()
+                if created:
+                    self._records_imported += 1
+            except Exception as exc:
+                savepoint.rollback()
+                self._rejected += 1
+                self._append_error(f"{entity.get('external_id', 'unknown')}: {exc}")
+
+        self.db.commit()
+
+        self._persist_relationships_bulk(relationships)
+
+        stats = {
+            "records_fetched": fetched,
+            "records_validated": len(entities) + len(relationships),
+            "records_imported": self._records_imported,
+            "records_updated": self._updated,
+            "records_skipped": self._relationships_skipped + self._revoked_skipped,
+            "records_rejected": self._rejected,
+            "revoked_or_deprecated_skipped": self._revoked_skipped,
+            "unsupported_objects_skipped": self._unsupported,
+            "relationships_created": self._relationships_created,
+            "relationships_skipped": self._relationships_skipped,
+            "evidence_added": self._evidence_added,
+        }
+        wrote_something = bool(
+            self._records_imported or self._updated or self._relationships_created
+        )
+        # A run that created documented relationships is a successful import even
+        # when every entity already existed. finish_job distinguishes an
+        # idempotent no-op from an empty import using the real counters.
+        status = "completed" if (wrote_something or self._rejected) else "completed_empty"
+        finish_job(self.db, job, status=status, stats=stats, errors=self._errors, details={
+            "bundle_url": self.stix_url,
+            "spec_version": self.bundle_version,
+            "revoked_or_deprecated_skipped": self._revoked_skipped,
+            "unsupported_objects_skipped": self._unsupported,
+        })
+        record_source_success(self.db, self._source, fetched, etag=self._etag)
+
+        return self._result(job, fetched=fetched, status=status, stats=stats)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _append_error(self, message: str) -> None:
+        self._error_count += 1
+        if len(self._errors) < MAX_STORED_ERRORS:
+            self._errors.append(message)
+
+    def _result(self, job: CollectionJob, *, fetched: int, status: str, stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        stats = stats or {}
         return {
             "source_name": self.source_name,
+            "source_key": "mitre_attack",
             "source_type": self.source_type,
-            "records_fetched": len(raw_data),
-            "records_parsed": len(parsed),
-            "records_validated": len(parsed),
-            "records_normalized": len(normalized.get("actors", []))
-            + len(normalized.get("campaigns", []))
-            + len(normalized.get("malware", []))
-            + len(normalized.get("tools", []))
-            + len(normalized.get("tactics", []))
-            + len(normalized.get("techniques", [])),
-            "records_imported": self._records_imported,
+            "source_url": self.stix_url,
+            "status": status,
+            "job_id": job.id,
+            "retrieved_at": utcnow().isoformat(),
+            "records_fetched": fetched,
+            "records_parsed": stats.get("records_validated", 0),
+            "records_validated": stats.get("records_validated", 0),
+            "records_normalized": stats.get("records_validated", 0),
+            "records_imported": stats.get("records_imported", 0),
+            "records_updated": stats.get("records_updated", 0),
+            "records_skipped": stats.get("records_skipped", 0),
+            "records_rejected": stats.get("records_rejected", 0),
+            "relationships_created": stats.get("relationships_created", 0),
+            "relationships_skipped": stats.get("relationships_skipped", 0),
+            "revoked_or_deprecated_skipped": stats.get("revoked_or_deprecated_skipped", self._revoked_skipped),
+            "unsupported_objects_skipped": stats.get("unsupported_objects_skipped", self._unsupported),
+            "evidence_added": stats.get("evidence_added", self._evidence_added),
+            "error_count": self._error_count,
             "errors": self._errors,
-            "relationships_created": relationships_created,
-            "relationships_skipped": relationships_skipped,
             "bundle_version": self.bundle_version,
         }
-
-    def _get_source_type_from_id(self, stix_id: str) -> str:
-        """Determine the entity type from a STIX ID prefix.
-
-        Args:
-            stix_id: STIX identifier string.
-
-        Returns:
-            The entity type string (actor, campaign, malware, tool, technique, tactic).
-        """
-        if stix_id.startswith("intrusion-set--"):
-            return "actor"
-        elif stix_id.startswith("campaign--"):
-            return "campaign"
-        elif stix_id.startswith("malware--"):
-            return "malware"
-        elif stix_id.startswith("tool--"):
-            return "tool"
-        elif stix_id.startswith("x-mitre-tactic--"):
-            return "tactic"
-        elif stix_id.startswith("attack-pattern--"):
-            return "technique"
-        elif stix_id.startswith("relationship--"):
-            return "relationship"
-        return "actor"

@@ -117,6 +117,8 @@ def create_evidence(
     source_confidence: Optional[str] = None,
     reliability: float = 0.5,
     raw_payload: Optional[dict] = None,
+    import_job_id: Optional[int] = None,
+    source_modified_at: Optional[datetime] = None,
     actor_id: Optional[int] = None,
     commit: bool = True,
 ) -> Evidence:
@@ -141,6 +143,9 @@ def create_evidence(
         source_confidence: Optional source-provided confidence value.
         reliability: Internal reliability score (0.0 to 1.0).
         raw_payload: Optional safely stored original source fields as JSON.
+        import_job_id: Optional CollectionJob that first stored this record.
+        source_modified_at: Optional source-side last-modified timestamp, when the
+            provider publishes one (distinct from publication and collection time).
         actor_id: Optional legacy actor ID for backward-compatible actor evidence.
         commit: Whether to commit the transaction immediately. When False,
             the record is added and flushed but not committed, allowing the
@@ -192,6 +197,8 @@ def create_evidence(
         source_confidence=source_confidence,
         reliability=reliability,
         raw_payload=raw_payload,
+        import_job_id=import_job_id,
+        source_modified_at=source_modified_at,
     )
 
     db.add(ev)

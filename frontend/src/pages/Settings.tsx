@@ -24,6 +24,22 @@ type Feed = {
   reason: string;
   docs?: string;
   produces?: string;
+  last_job?: {
+    status: string;
+    fetched: number;
+    imported: number;
+    updated: number;
+    skipped: number;
+    rejected: number;
+    relationships_created: number;
+    error_count: number;
+    finished?: string | null;
+  } | null;
+  source_record?: {
+    last_success_at?: string | null;
+    last_object_count?: number | null;
+    last_error?: string | null;
+  } | null;
 };
 
 type Source = {
@@ -35,6 +51,9 @@ type Source = {
   origin: string;
   url: string | null;
   collected_at: string;
+  last_success_at?: string | null;
+  last_error?: string | null;
+  last_object_count?: number | null;
 };
 
 export default function Settings() {
@@ -282,6 +301,31 @@ export default function Settings() {
               <p className="mt-1 text-xs text-slate-500">{feed.description}</p>
               <p className="mt-2 text-xs text-slate-400">{feed.reason}</p>
               {feed.produces && <p className="mt-1 text-xs text-slate-600">{feed.produces}</p>}
+              <dl className="mt-2 space-y-1 text-xs text-slate-400">
+                <div>
+                  <dt className="inline text-slate-500">Last successful import: </dt>
+                  <dd className="inline">
+                    {feed.source_record?.last_success_at
+                      ? new Date(feed.source_record.last_success_at).toLocaleString()
+                      : "never"}
+                  </dd>
+                </div>
+                {feed.last_job && (
+                  <div>
+                    <dt className="inline text-slate-500">Last run: </dt>
+                    <dd className="inline">
+                      {feed.last_job.status} · {feed.last_job.imported} entities stored /{" "}
+                      {feed.last_job.fetched} fetched · {feed.last_job.rejected} rejected
+                      {feed.last_job.relationships_created > 0 && (
+                        <span> · {feed.last_job.relationships_created} relationships</span>
+                      )}
+                      {feed.last_job.error_count > 0 && (
+                        <span className="text-amber-400"> · {feed.last_job.error_count} error(s)</span>
+                      )}
+                    </dd>
+                  </div>
+                )}
+              </dl>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button
                   variant="secondary"
@@ -323,7 +367,12 @@ export default function Settings() {
                 setRunning("mitre");
                 try {
                   const result = await api.ingestion.mitre();
-                  add("success", `MITRE import complete — ${result.techniques ?? 0} techniques`);
+                  add(
+                    "success",
+                    `MITRE ATT&CK: ${Number(result.records_imported ?? 0)} objects imported, ${Number(
+                      result.relationships_created ?? 0,
+                    )} relationships created`,
+                  );
                 } catch (err) {
                   add("error", err instanceof Error ? err.message : "MITRE import failed");
                 } finally {
@@ -351,6 +400,7 @@ export default function Settings() {
                   <th className="py-2">Origin</th>
                   <th className="py-2">Reliability</th>
                   <th className="py-2">Synthetic</th>
+                  <th className="py-2">Last success</th>
                   <th className="py-2">Collected</th>
                 </tr>
               </thead>
@@ -366,6 +416,14 @@ export default function Settings() {
                     </td>
                     <td className="py-2 text-xs text-slate-400">{source.reliability.toFixed(2)}</td>
                     <td className="py-2 text-xs text-slate-400">{source.is_synthetic ? "yes" : "no"}</td>
+                    <td className="py-2 text-xs text-slate-500">
+                      {source.last_success_at ? new Date(source.last_success_at).toLocaleDateString() : "—"}
+                      {source.last_error && (
+                        <span className="ml-1 text-amber-400" title={source.last_error}>
+                          error
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2 text-xs text-slate-500">
                       {source.collected_at ? new Date(source.collected_at).toLocaleDateString() : "—"}
                     </td>

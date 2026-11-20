@@ -14,6 +14,7 @@ Every record is explicitly marked ``origin='synthetic'`` /
 copy of a record it already created: it looks up each entity before inserting.
 """
 
+import argparse
 import datetime as dt
 import os
 import sys
@@ -21,6 +22,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from app.core.config import get_settings
 from app.core.security import hash_password
 from app.core.time import utcnow
 from app.database.session import Base, SessionLocal, engine
@@ -43,6 +45,39 @@ from app.models.entities import (
 from app.services.relationship_engine import build_direct_relationships, build_inferred_relationships
 
 Base.metadata.create_all(bind=engine)
+
+
+def _require_demo_consent() -> None:
+    """Synthetic demonstration data is opt-in only.
+
+    The production application must contain genuine intelligence only. This
+    script therefore refuses to run unless the operator explicitly asks for the
+    demonstration dataset.
+    """
+    parser = argparse.ArgumentParser(description="Insert the synthetic demonstration dataset.")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="required: confirms that labelled synthetic demonstration data may be inserted",
+    )
+    args = parser.parse_args()
+    if get_settings().environment == "production":
+        print(
+            "Refusing to seed: ENVIRONMENT=production must contain genuine intelligence\n"
+            "only. Demonstration data is limited to development and test databases.\n"
+        )
+        raise SystemExit(2)
+    if args.demo or os.environ.get("ALLOW_SYNTHETIC_SEED", "").strip().lower() in ("1", "true", "yes"):
+        return
+    print(
+        "Refusing to seed: this script inserts SYNTHETIC demonstration records that are not\n"
+        "real intelligence. Re-run with --demo (development/demo environments only), or\n"
+        "import genuine data with the feed connectors instead.\n"
+    )
+    raise SystemExit(2)
+
+
+_require_demo_consent()
 
 db = SessionLocal()
 counts = {"created": 0, "reused": 0}

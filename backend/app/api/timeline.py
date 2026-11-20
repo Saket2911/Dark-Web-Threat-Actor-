@@ -8,6 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
+from app.core.provenance import hidden_actor_ids, synthetic_visible
 from app.core.time import end_of_day, parse_datetime
 from app.database.session import get_db
 from app.models.entities import Actor, TimelineEvent
@@ -33,6 +34,7 @@ def list_timeline(
     event_type: Optional[str] = None,
     order: str = Query("asc", pattern="^(asc|desc)$"),
     limit: int = Query(500, ge=1, le=2000),
+    include_synthetic: bool = Query(False, description="Include labelled demonstration records (never in production)"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
@@ -44,6 +46,12 @@ def list_timeline(
     query = db.query(TimelineEvent, Actor.primary_handle).outerjoin(
         Actor, TimelineEvent.actor_id == Actor.id
     )
+    if not synthetic_visible(include_synthetic):
+        hidden = hidden_actor_ids(db)
+        if hidden:
+            query = query.filter(
+                (TimelineEvent.actor_id.is_(None)) | (~TimelineEvent.actor_id.in_(hidden))
+            )
     if actor_id:
         query = query.filter(TimelineEvent.actor_id == actor_id)
     if event_type:
@@ -74,8 +82,18 @@ def list_timeline(
 
 
 @router.get("/summary")
-def timeline_summary(actor_id: Optional[int] = None, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def timeline_summary(
+    actor_id: Optional[int] = None,
+    include_synthetic: bool = Query(False),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
     query = db.query(TimelineEvent)
+    hidden = set() if synthetic_visible(include_synthetic) else hidden_actor_ids(db)
+    if hidden:
+        query = query.filter(
+            TimelineEvent.actor_id.is_(None) | (~TimelineEvent.actor_id.in_(hidden))
+        )
     if actor_id:
         query = query.filter(TimelineEvent.actor_id == actor_id)
     events = query.all()
@@ -87,18 +105,23 @@ def timeline_summary(actor_id: Optional[int] = None, db: Session = Depends(get_d
         by_day[day] = by_day.get(day, 0) + 1
         by_type[event.event_type or "unknown"] = by_type.get(event.event_type or "unknown", 0) + 1
 
+    actor_query = (
+        db.query(TimelineEvent.actor_id, Actor.primary_handle, func.count(TimelineEvent.id))
+        .outerjoin(Actor, TimelineEvent.actor_id == Actor.id)
+        .group_by(TimelineEvent.actor_id, Actor.primary_handle)
+    )
+    if hidden:
+        actor_query = actor_query.filter(
+            TimelineEvent.actor_id.is_(None) | (~TimelineEvent.actor_id.in_(hidden))
+        )
+
     return {
         "total": len(events),
         "by_day": [{"date": day, "count": count} for day, count in sorted(by_day.items())],
         "by_type": [{"type": key, "count": value} for key, value in sorted(by_type.items())],
         "actors": [
             {"actor_id": row[0], "handle": row[1], "count": row[2]}
-            for row in db.query(
-                TimelineEvent.actor_id, Actor.primary_handle, func.count(TimelineEvent.id)
-            )
-            .outerjoin(Actor, TimelineEvent.actor_id == Actor.id)
-            .group_by(TimelineEvent.actor_id, Actor.primary_handle)
-            .all()
+            for row in actor_query.all()
         ],
     }
 

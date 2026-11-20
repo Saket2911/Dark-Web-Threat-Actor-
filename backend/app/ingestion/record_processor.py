@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.time import parse_datetime, utcnow
 from app.models.entities import (
     Actor,
@@ -124,6 +125,13 @@ def resolve_source(db: Session, rec: IngestRecord) -> IntelligenceSource:
 
 def process_record(db: Session, rec: IngestRecord) -> ProcessResult:
     """Import a single record inside the caller's transaction."""
+    settings = get_settings()
+    if rec.is_synthetic and settings.environment == "production":
+        raise RecordRejected(
+            "Synthetic records cannot be ingested while ENVIRONMENT=production. "
+            "Mark the record as real intelligence with traceable provenance, or run "
+            "the application in a development environment."
+        )
     source = resolve_source(db, rec)
     origin = source.origin or "external"
 

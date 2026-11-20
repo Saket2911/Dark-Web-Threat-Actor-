@@ -1,20 +1,25 @@
-# Dark Web Threat Actor De-anonymization and Intelligence Platform
+# Threat Actor Intelligence Platform (CN_Project)
 
-An intelligence-analysis and decision-support platform for investigating pseudonymous
-threat actors. Analysts can correlate accounts through shared identifiers, inspect
-writing-style and behavioural similarity, map infrastructure associations, review
-relationships in a case workflow, and export reports.
+An evidence-driven threat-intelligence platform for investigating threat actors. It
+imports **genuine public intelligence**, keeps the provenance of every record, derives
+relationships only from documented evidence, and supports analyst review, analysis and
+reporting.
 
-The platform produces **investigative hypotheses**, never identity verdicts. Direct
-links come only from identical, normalised identifiers; every analytical link is
-labelled as an inference and requires analyst review.
+The platform produces **investigative hypotheses**, never identity verdicts. Direct links
+come from documented source records; analytical similarity is labelled as an inference
+and requires analyst review.
+
+> **Data policy.** Production views contain records that trace back to a real source.
+> Synthetic demonstration data exists only for automated tests and an explicitly
+> requested demo mode. It is never presented as intelligence, and feeds that cannot
+> authenticate report that state instead of inventing data.
 
 ## Stack
 
 | Layer | Technology |
 | --- | --- |
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, SQLite, Alembic, Pydantic v2 |
-| Auth | JWT (HS256), PBKDF2-SHA256 password hashing, admin/analyst roles |
+| Auth | JWT (HS256), PBKDF2-SHA256 hashing, admin/analyst roles |
 | Analysis | scikit-learn (TF-IDF, K-Means, DBSCAN), NetworkX, NumPy |
 | Reporting | CSV, JSON, ReportLab PDF |
 | Frontend | React 19, TypeScript, Vite 8, Tailwind CSS, Cytoscape.js, Recharts |
@@ -25,26 +30,19 @@ labelled as an inference and requires analyst review.
 backend/
   app/api/          REST routers (auth, actors, ingestion, graph, analysis, infra,
                     timeline, investigations, reports, settings, dashboard, health)
-  app/core/         configuration, security, dependencies, time helpers
-  app/database/     engine/session configuration
-  app/models/       SQLAlchemy models
-  app/schemas/      Pydantic request/response models
-  app/services/     audit, identifier normalisation, relationship engine/validator
+  app/core/         configuration, security, provenance filters, time helpers
+  app/ingestion/    base adapter, MITRE ATT&CK, public feeds, job tracking,
+                    validation, normalisation, deduplication
+  app/services/     audit, identifiers, relationship engine/validators, evidence
   app/ml/           stylometry, behavioural, scoring, clustering, inference
-  app/ingestion/    record processor, CSV/JSON, STIX 2.1, public feeds, MITRE ATT&CK
-  migrations/       Alembic environment and revisions
-  scripts/          seed.py, dedupe_synthetic.py
-  tests/            pytest suite (67 tests)
-  data/app.db       canonical SQLite database
-frontend/
-  src/pages/        Login, Dashboard, Actors, ActorProfile, Graph, Analysis,
-                    Infrastructure, Timeline, Investigations, Reports, Settings
-  src/services/api.ts   typed API client
-  src/components/   shared UI primitives and toast notifications
-  src/layouts/      application shell and navigation
+  migrations/       Alembic revisions (head: d3e4f5a6b7c8)
+  scripts/          import_intel.py, seed.py (demo only), dedupe_synthetic.py
+  tests/            pytest suite (84 tests)
+  data/app.db       canonical SQLite database (not committed)
+frontend/           React application (11 pages) and typed API client
 ```
 
-## Quick start (Windows, PowerShell/Git Bash)
+## Quick start
 
 ```bash
 # Backend
@@ -52,7 +50,7 @@ cd backend
 python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -r requirements.txt
 ./.venv/Scripts/python.exe -m alembic upgrade head
-./.venv/Scripts/python.exe scripts/seed.py          # idempotent demonstration data
+./.venv/Scripts/python.exe scripts/import_intel.py --source all   # genuine data
 ./.venv/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 # Frontend (second terminal)
@@ -61,158 +59,175 @@ npm install
 npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-Open <http://127.0.0.1:5173>. API docs: <http://127.0.0.1:8000/docs>.
+Open <http://127.0.0.1:5173>; API docs at <http://127.0.0.1:8000/docs>. Linux/macOS
+uses `backend/.venv/bin/python`.
 
-Linux/macOS uses `backend/.venv/bin/python` in the same commands.
+### Accounts
 
-### Default development accounts
-
-| Username | Password | Role |
-| --- | --- | --- |
-| `admin` | `admin123` | admin |
-| `analyst` | `analyst123` | analyst |
-
-These accounts are seeded demonstration credentials. Change or remove them before
-any non-local deployment.
+Create the first accounts through your deployment process or the demo seed below.
+The demo seed adds `admin/admin123` (admin) and `analyst/analyst123` (analyst); change
+or remove them before any non-local deployment. Registration is admin-only.
 
 ## Configuration
 
-Configuration is read from `backend/.env` or the project-root `.env` (the root file
-wins when both define a key). Copy `.env.example` to `.env` and set:
+Settings come from `backend/.env` or the project-root `.env` (root wins on conflicts).
+Copy `.env.example` to `.env`:
 
-* `SECRET_KEY` – required for production; the app logs a warning while it is the
-  placeholder value.
-* `DATABASE_URL` – defaults to `sqlite:///./data/app.db`, resolved against
-  `backend/`, so commands work from any working directory.
-* `CORS_ORIGINS` – comma-separated browser origins. Defaults to the two Vite
-  development origins; `*` is rejected for anything beyond local experiments.
-* `ABUSE_CH_AUTH_KEY` – optional; required only for ThreatFox.
-
-Secrets are never returned by the API. `/api/settings/system` reports only whether
-the JWT secret is configured.
-
-## Database and migrations
-
-The canonical database is `backend/data/app.db`; current Alembic head is
-`b7c1d2e3f4a5` (query indexes). Migrations are additive and were applied without
-resetting existing rows.
-
-```bash
-cd backend
-./.venv/Scripts/python.exe -m alembic current
-./.venv/Scripts/python.exe -m alembic upgrade head
-```
-
-A stale database from the earlier layout may exist at `data/app.db` (project root).
-It is not used by the application. Remove it only after taking a backup and
-confirming it contains nothing you need.
-
-### Demonstration data and provenance
-
-`scripts/seed.py` is idempotent: it reuses existing demo actors and records, and
-creates only what is missing. It seeds six scenarios (shared PGP fingerprint, similar
-writing, similar hourly behaviour, marketplace migration, superficially similar but
-unrelated writing, conflicting evidence), analysis results derived from the seeded
-samples, direct relationships built from shared identifiers, one inferred hypothesis,
-and an investigation with a pending review.
-
-All demonstration actors use `origin='synthetic'` and their sources are marked
-`is_synthetic=true`. The UI exposes origin filters and labels synthetic evidence, so
-synthetic records remain distinguishable from external intelligence.
-
-An earlier run created multiple copies of each demo handle. `scripts/dedupe_synthetic.py`
-reports those groups (dry-run by default). It only removes duplicates that have no
-dependent records, and `--apply` additionally requires `--yes`. Duplicates with
-identifiers, evidence or relationships are reported as skipped and must be merged by
-an analyst.
-
-## Testing
-
-```bash
-cd backend
-./.venv/Scripts/python.exe -m pytest tests -q
-
-cd ../frontend
-npm run build      # tsc -b && vite build
-npm run lint       # oxlint (requires its native binary to be permitted by the host)
-```
-
-The backend suite uses a temporary SQLite database per test session
-(`tests/conftest.py`), so it never touches `backend/data/app.db`. See
-`TEST_REPORT.md` for the latest results.
-
-## API overview
-
-All endpoints are under `/api` and require a bearer token except `/auth/login` and
-`/health`.
-
-| Area | Endpoints |
+| Variable | Purpose |
 | --- | --- |
-| Auth | `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/register` (admin), users list (admin) |
-| Actors | `GET/POST /actors`, `GET/PATCH/DELETE /actors/{id}`, `/profile`, `/identifiers`, `/handles`, `/evidence`, `/timeline`, `GET /actors/categories` |
-| Ingestion | `POST /ingestion/record`, `/csv`, `/json`, `/stix`, `/mitre-attack`, `/feeds/{key}`, `GET /ingestion/jobs`, `/ingestion/feeds` |
-| Graph | `GET /graph/data`, `/stats`, `/components`, `/clusters`, `/relationships/{id}`; `POST /graph/build`, `/infer`, `/relationships` |
-| Analysis | `POST /analysis/stylometry`, `/behavioural`, `/score`, `/cluster`, `/cluster/kmeans`, `/cluster/behavioural`; models train/infer/batch/status; `GET /analysis/history` |
-| Infrastructure | `GET/POST /infrastructure`, `GET /infrastructure/{id}`, `/associations` |
-| Timeline | `GET/POST /timeline`, `GET /timeline/summary` |
-| Investigations | `GET/POST /investigations`, `GET/PATCH/DELETE /investigations/{id}`, `/entities`, `/review`, `/reviews` |
-| Reports | `GET /reports/export/csv?kind=`, `/export/json?kind=`, `/pdf/{actor_id}`, `/pdf/investigation/{id}` |
-| Dashboard | `GET /dashboard/stats`, `/charts/{category,activity,sources,identifiers,relationships,origin}`, `/recent`, `/activity-log` |
-| Settings | `/settings/sources`, `/weights/default`, `/thresholds`, `/models`, `/feeds`, `/system`, `/health` |
+| `SECRET_KEY` | JWT signing secret. Required outside local development. |
+| `DATABASE_URL` | Defaults to `sqlite:///./data/app.db`, resolved against `backend/`. |
+| `CORS_ORIGINS` | Comma-separated browser origins; defaults to the two Vite origins. |
+| `ENVIRONMENT` | `development` or `production`. Production disables synthetic ingestion, demo seeding and every synthetic read path. |
+| `ABUSE_CH_AUTH_KEY` | Free abuse.ch Auth-Key. Required by **both** URLhaus and ThreatFox. |
+| `FEED_TIMEOUT_SECONDS`, `FEED_MAX_RETRIES` | Feed HTTP timeout and retry budget. |
 
-Export kinds: `actors`, `identifiers`, `relationships`, `evidence`, `timeline`,
-`investigations`.
+Secrets are never returned by the API; `/api/settings/system` reports only whether the
+JWT secret is configured.
 
-## External intelligence
+## Genuine intelligence sources
 
-| Source | Interface | Status |
-| --- | --- | --- |
-| MITRE ATT&CK | Official enterprise STIX bundle from `mitre-attack/attack-stix-data` | Implemented; import is admin-only and can be run from Settings |
-| APTnotes | Public JSON index on GitHub | Implemented, no key required |
-| URLhaus | abuse.ch public recent-URL endpoint | Implemented, no key required |
-| ThreatFox | abuse.ch IOC API | Implemented but disabled without `ABUSE_CH_AUTH_KEY`; the API reports `blocked_missing_credentials` rather than pretending to work |
+| Source | Interface | Requires key | Verified |
+| --- | --- | --- | --- |
+| MITRE ATT&CK Enterprise | Official STIX 2.1 bundle from `attack-stix-data` | no | Yes — 26,699 objects fetched, 1,820 entities and 19,481 relationships imported |
+| APTnotes | Public report index JSON from `aptnotes/data` | no | Yes — 689 records fetched, 687 stored, 0 rejected; repeated imports are no-ops |
+| URLhaus | abuse.ch API (`/v1/urls/recent/`) | **yes** | Blocked — `blocked_missing_credentials` without a key |
+| ThreatFox | abuse.ch API (`get_iocs`) | **yes** | Blocked — `blocked_missing_credentials` without a key |
+| CISA KEV | Public JSON catalogue | no | Evaluated, not integrated: it lists exploited vulnerabilities, and the platform has no vulnerability entity that would materialise into actor intelligence |
 
-Feeds use timeouts, bounded retries with backoff, 429 handling, provenance records and
-deduplication on the feed record ID. Availability depends on the upstream service and
-network access. No restricted service is scraped and no access control is bypassed.
+Import from the Settings page, the API, or the CLI:
 
-## Analysis semantics
+```bash
+./.venv/Scripts/python.exe scripts/import_intel.py --source mitre
+./.venv/Scripts/python.exe scripts/import_intel.py --source aptnotes --limit 500
+./.venv/Scripts/python.exe scripts/import_intel.py --source urlhaus   # needs the key
+```
 
-* **Stylometry** – word 1–2 gram TF-IDF cosine (55%) plus lexical/punctuation closeness
-  (45%). Short samples and identical text are flagged; identical samples are not treated
-  as independent evidence.
-* **Behavioural** – cosine similarity of normalised 24-bin hourly activity histograms.
-  Fewer than three events per actor is marked insufficient; low-event scores are shown
-  as indicative only.
-* **Attribution** – weighted mean over *available* features with a coverage figure.
-  Missing evidence lowers coverage; coverage below 40% caps the result at
-  "Insufficient". Contributions are reported per feature and the same underlying
-  evidence is not counted twice.
-* **Clustering** – K-Means over standardised structural features, DBSCAN over hourly
-  activity vectors with cosine metric. Small datasets return an explicit
-  `insufficient_data` result. Silhouette is only reported when mathematically defined.
+### Collection jobs and honest statistics
+
+Every run — including a direct `ingest_feed()` call — creates a `collection_jobs` row
+with the source key, URL, retrieval time and separate counters:
+
+`records_fetched`, `records_validated`, `records_imported` (entities created),
+`records_updated`, `records_skipped`, `records_rejected`, `relationships_created`,
+`error_count`, plus a bounded error list and structured `details`.
+
+Status values are derived from those counters, not assumed:
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | At least one entity, update or relationship was written |
+| `completed_no_changes` | Everything fetched was already stored; a successful idempotent no-op |
+| `completed_empty` | The source answered but nothing usable was stored |
+| `completed_with_errors` | Records were stored, but some failed validation |
+| `not_modified` | Conditional refresh (ETag) confirmed the source is unchanged |
+| `failed` | The run could not produce a usable result; nothing is reported as success |
+
+A relationship-only import is therefore a success: MITRE runs that add documented
+relationships but no new entities are reported with `relationships_created`, never as
+`completed_empty`.
+
+Historical rows are preserved. Job 2, which created the 19,481 relationships before the
+`relationships_created` column existed, keeps its original counters; the known count is
+recorded in `TEST_REPORT.md` and is proposed for an audit-log annotation only.
+
+### What each connector stores
+
+* **MITRE ATT&CK** — groups (intrusion sets), campaigns, malware, tools, tactics,
+  techniques and the relationships MITRE documents between them. Original STIX IDs,
+  aliases, external references and created/modified timestamps are preserved. Revoked
+  and deprecated objects are skipped and counted. MITRE group attribution is stored as
+  `relationship_classification='documented'`, `confidence_level='limited'` because
+  ATT&CK attribution is a catalogued assessment, not verified identity.
+* **APTnotes** — report metadata exactly as published: filename, title, publisher,
+  link, SHA-1, date/year. No fields are invented. A report is linked to a group only
+  when its title contains that group's name or alias as a whole word, and only groups
+  imported from a real source are eligible. Every import creates a tracked job.
+* **URLhaus / ThreatFox** — indicators (URL/domain/IP/hash), source identifiers,
+  timestamps, tags, reporter and malware family, plus `INDICATES` links from the
+  indicator to the malware family the source names. Without an Auth-Key they report
+  `blocked_missing_credentials` and write nothing.
+
+## Provenance model
+
+Each imported record keeps:
+
+* the intelligence source (`intelligence_sources`, `origin='external'` and health fields);
+* the source's own record identifier (`evidence.external_record_id`);
+* the original reference/URL (`evidence.reference`, `evidence.source_url`);
+* the source publication time (`source_published_at`) and, when the provider publishes
+  one, the source last-modified time (`source_modified_at`);
+* the raw source payload (`evidence.raw_payload`);
+* the collection job that first stored it (`evidence.import_job_id`).
+
+New imports populate all of these. Evidence imported before the columns existed has been
+backfilled from stored payloads only (`TEST_REPORT.md`): the 1,820 MITRE rows are linked
+to collection job 1 with `source_modified_at` taken from STIX `modified`, and the 687
+APTnotes rows are linked to job 8, status `historical_backfill` — the source publishes no
+modified timestamp, so theirs stays NULL. No interleaved import can claim another job's
+rows: evidence is deduplicated on (source, external record ID, entity), so the first
+storing job owns it.
+
+Deduplication keys: entities on `external_id` (STIX/source ID), evidence on
+(source, external record ID, entity), relationships on their endpoints and type.
+Re-imports are idempotent; MITRE also supports conditional refresh with the stored
+ETag (`status: not_modified` when the bundle is unchanged).
+
+## Demonstration data and cleanup
+
+`scripts/seed.py` inserts synthetic scenarios and **requires `--demo`** (or
+`ALLOW_SYNTHETIC_SEED=true`). It refuses to run in `ENVIRONMENT=production`, and the API
+rejects synthetic ingestion there as well.
+
+Default read paths hide every demonstration artefact consistently: synthetic actors,
+legacy demo actors, synthetic/demo evidence, demo indicators, synthetic-only
+relationships, synthetic analyses, demonstration investigations and demo timeline
+events. Genuine records with missing fields (for example an APTnotes report with no
+linked actor) stay visible. Pass `include_synthetic=true` in a non-production
+environment to see demonstration rows.
+
+`scripts/dedupe_synthetic.py` inventories every demonstration record, its dependents
+and any analyst artefacts attached to it:
+
+```bash
+./.venv/Scripts/python.exe scripts/dedupe_synthetic.py          # dry run
+./.venv/Scripts/python.exe scripts/dedupe_synthetic.py --json   # machine readable
+./.venv/Scripts/python.exe scripts/dedupe_synthetic.py --apply --yes
+```
+
+A record is never deleted automatically when it belongs to an investigation, carries an
+analyst review/decision, or is compared against a real actor. Those are reported for
+analyst review. The `--apply` step requires explicit confirmation and never touches
+real records. The live database still contains 58 legacy demo and 33 synthetic actors;
+they are hidden from production views and were not deleted.
+
+## Verification
+
+```bash
+cd backend
+./.venv/Scripts/python.exe -m alembic current      # d3e4f5a6b7c8 (head)
+./.venv/Scripts/python.exe -m pytest tests -q      # 84 passed
+cd ../frontend
+npm run build                                      # tsc -b + vite build
+```
+
+Verified live against the canonical database: 187 genuine actors, 19,481 documented
+relationships, 2,507 genuine evidence rows, zero demonstration rows in default views
+and exports, accurate APTnotes job statistics with idempotent re-imports, MITRE
+provenance fields, and the preserved demonstration investigation plus its pending
+analyst decision. See `TEST_REPORT.md` for the full run.
 
 ## Known limitations
 
-* The database is SQLite with no concurrent-writer scaling; suitable for single-analyst
-  or small-team deployments.
-* Similarity scores depend on sample quality. Copied text, shared templates, common
-  time zones and shared hosting can inflate scores.
-* Synthetic demonstration records remain in the database and are labelled, not hidden.
-* Duplicate synthetic handles created by an earlier seed run have not been merged
-  because merging requires analyst decisions; use `scripts/dedupe_synthetic.py` to
-  review them.
-* ThreatFox cannot be exercised without an abuse.ch key.
-* Frontend bundle is a single ~1.3 MB chunk (385 KB gzip); code splitting is not
-  configured.
-* No automated browser end-to-end suite is configured; integration checks were run
-  against the live servers and are documented in `TEST_REPORT.md`.
-
-## Documentation
-
-* `PROJECT_COMPLETION_AUDIT.md` – original state, defects, root causes, fixes.
-* `IMPLEMENTATION_STATUS.md` – phase-by-phase completion status.
-* `TEST_REPORT.md` – executed tests, results and limitations.
-* `AUDIT_REPORT.md` – historical audit retained for reference.
-#   D a r k - W e b - T h r e a t - A c t o r -  
- 
+* APTnotes publishes no last-modified timestamp, so `source_modified_at` is NULL for its
+  evidence by design; MITRE and other providers are stamped automatically.
+* URLhaus and ThreatFox cannot be verified without a free abuse.ch Auth-Key; the
+  connectors implement the documented `Auth-Key` header and fail honestly without it.
+* MITRE ATT&CK relationships describe ATT&CK's own catalogue; they do not prove actor
+  identity, and the UI labels them as limited-confidence documented associations.
+* APTnotes provides report metadata only (no structured indicators), so it is stored
+  as report evidence, not as IOCs.
+* Stylometric, behavioural and clustering analyses report `insufficient data` when the
+  genuine corpus is too small; no result is fabricated.
+* The graph caps displayed edges (default 1,500, disclosed in the UI); the full
+  catalogue stays in the database.

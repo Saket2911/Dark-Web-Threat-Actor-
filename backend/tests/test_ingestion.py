@@ -289,9 +289,11 @@ def test_feed_status_reports_real_configuration(client, admin_headers):
     assert response.status_code == 200
     feeds = {feed["key"]: feed for feed in response.json()}
     assert feeds["aptnotes"]["configured"] is True
-    assert feeds["urlhaus"]["configured"] is True
     assert feeds["mitre_attack"]["configured"] is True
-    # ThreatFox needs a key that is intentionally absent in the test environment
+    # abuse.ch requires a free Auth-Key for URLhaus and ThreatFox; the test
+    # environment intentionally has none configured.
+    assert feeds["urlhaus"]["configured"] is False
+    assert feeds["urlhaus"]["status"] == "blocked_missing_credentials"
     assert feeds["threatfox"]["configured"] is False
     assert feeds["threatfox"]["status"] == "blocked_missing_credentials"
 

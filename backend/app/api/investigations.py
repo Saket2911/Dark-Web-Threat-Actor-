@@ -89,14 +89,18 @@ def _review_counts(db: Session, investigation_id: int) -> dict:
 @router.get("")
 def list_investigations(
     status_filter: Optional[str] = Query(None, alias="status"),
+    include_synthetic: bool = Query(False, description="Include cases that only reference demonstration records"),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
-    query = db.query(Investigation)
+    from app.core.provenance import hide_synthetic_investigations
+
+    query = hide_synthetic_investigations(db.query(Investigation), include_synthetic)
     if status_filter:
         query = query.filter(Investigation.status == status_filter)
     output = []
     for investigation in query.order_by(Investigation.created_at.desc(), Investigation.id.desc()).all():
+        members = _member_actor_ids(db, investigation.id)
         counts = _review_counts(db, investigation.id)
         output.append(
             {
@@ -105,7 +109,7 @@ def list_investigations(
                 "status": investigation.status,
                 "created_at": investigation.created_at,
                 "notes": investigation.notes,
-                "entity_count": len(_member_actor_ids(db, investigation.id)),
+                "entity_count": len(members),
                 "reviews": counts,
             }
         )
@@ -138,8 +142,17 @@ def create_investigation(
 
 
 @router.get("/{investigation_id}")
-def get_investigation(investigation_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def get_investigation(
+    investigation_id: int,
+    include_synthetic: bool = Query(False, description="Include cases built only from demonstration records"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    from app.core.provenance import hidden_investigation_ids, synthetic_visible
+
     investigation = _get_investigation(db, investigation_id)
+    if not synthetic_visible(include_synthetic) and investigation_id in hidden_investigation_ids(db):
+        raise HTTPException(404, "Investigation not found")
     member_ids = _member_actor_ids(db, investigation_id)
 
     entities = []
